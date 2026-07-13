@@ -75,15 +75,15 @@
                         </div>
                         <div class="form-group">
                             <label id="lbl-bot-personality" for="bot-personality">Personalidade do Bot (IA)</label>
-                            <textarea id="bot-personality" class="form-control" maxlength="500" rows="3" placeholder="Descreva como o bot deve se comportar..."></textarea>
-                            <small class="form-text text-right"><span id="personality-count">0</span>/500</small>
+                            <textarea id="bot-personality" class="form-control" maxlength="1500" rows="3" placeholder="Descreva como o bot deve se comportar..."></textarea>
+                            <small class="form-text text-right"><span id="personality-count">0</span>/1500</small>
                         </div>
                         <div class="form-group checkbox-group">
                             <input type="checkbox" id="custom-ignores-prefix">
                             <label id="lbl-custom-ignores" for="custom-ignores-prefix">Comandos Personalizados sem Prefixo</label>
                         </div>
                         <div class="form-group">
-                            <button type="button" id="btn-view-members" class="btn btn-secondary"><i class="fas fa-users"></i> Ver Membros do Grupo</button>
+                            <button type="button" id="btn-view-members" class="btn btn-secondary"><i class="fas fa-users"></i> Membros do Grupo & Apelidos</button>
                         </div>
                         <div class="form-actions">
                             <button type="button" class="btn btn-primary btn-save-section" data-section="geral">Salvar Geral</button>
@@ -208,6 +208,16 @@
                         </div>
 
                         <div class="form-group checkbox-group">
+                            <input type="checkbox" id="notifica-grupo-fechado">
+                            <label id="lbl-notifica-grupo-fechado" for="notifica-grupo-fechado">Notificar quando o grupo é Fechado</label>
+                        </div>
+
+                        <div class="form-group checkbox-group">
+                            <input type="checkbox" id="notifica-grupo-aberto">
+                            <label id="lbl-notifica-grupo-aberto" for="notifica-grupo-aberto">Notificar quando o grupo é Aberto</label>
+                        </div>
+
+                        <div class="form-group checkbox-group">
                             <input type="checkbox" id="auto-interaction">
                             <label id="lbl-auto-interaction" for="auto-interaction">Interações Automáticas</label>
                         </div>
@@ -220,6 +230,11 @@
                             <div class="slider-group">
                                 <label id="lbl-interaction-cooldown">Cooldown: <span id="cooldown-val">5</span> minutos</label>
                                 <input type="range" id="interaction-cooldown" min="5" max="43200" class="slider">
+                            </div>
+                            <div class="slider-group">
+                                <label id="lbl-interaction-proporcao">Proporção IA: <span id="proporcao-val">50</span>%</label>
+                                <input type="range" id="interaction-proporcao" min="0" max="100" class="slider">
+                                <span id="proporcao-desc" style="font-size: 0.85em; font-style: italic; display: block; margin-top: 5px; color: #888;"></span>
                             </div>
                         </div>
                         
@@ -436,12 +451,24 @@
                     </div>
                 </div>
 
+                <div class="form-group">
+                    <label id="lbl-cmd-cooldown">Cooldown <i class="fas fa-info-circle" title="Tempo mínimo entre usos do comando (em segundos). 0 = sem cooldown. Máximo: 60000s (~16,6h)"></i></label>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <input type="number" id="cmd-cooldown" class="form-control" placeholder="0" min="0" max="60000" step="1" style="max-width: 120px;">
+                        <span id="cmd-cooldown-label" class="text-muted" style="font-size: 0.85em;">segundos</span>
+                    </div>
+                </div>
+
+
                 <div class="list-manager-section">
                     <label id="lbl-cmd-tags">Marcar Pessoas <i class="fas fa-info-circle" title="Pessoas que serão marcadas na mensagem. O número é encriptado pelo WhatsApp, por isso parece 'estranho' ( @lids)"></i></label>
                     <div class="input-group">
                         <button type="button" id="btn-add-tag" class="btn btn-secondary" style="width: 100%;"><i class="fas fa-user-plus"></i> Adicionar Menção</button>
                     </div>
                     <div id="cmd-tags-list" class="tags-container"></div>
+                    <div id="cmd-tags-helper" class="text-muted small mt-1 hidden" style="font-size: 0.8em; line-height: 1.3; margin-top: 5px;">
+                        Os números aqui serão marcados na mensagem independente da variável {mention-123...} (marcação oculta). Use a variável no texto do comando para exibir o nome da pessoa marcada.
+                    </div>
                 </div>
 
                 <div class="responses-section">
@@ -686,7 +713,7 @@
     <div id="member-modal" class="modal hidden">
         <div class="modal-content">
             <div class="modal-header">
-                <h2 id="member-modal-title">Membros do Grupo</h2>
+                <h2 id="member-modal-title">Membros do Grupo & Apelidos</h2>
                 <span class="close-member-modal">&times;</span>
             </div>
             <div class="modal-body">
@@ -698,7 +725,7 @@
                             <tr>
                                 <th>Telefone</th>
                                 <th>LID/ID</th>
-                                <th>Ação</th>
+                                <th id="member-action-header">Ação</th>
                             </tr>
                         </thead>
                         <tbody id="member-table-body">

@@ -3,6 +3,35 @@ const Database = require("./utils/Database");
 const path = require("path");
 const fs = require("fs").promises;
 
+const MIN_REASON_LENGTH = 15;
+
+/**
+ * Verifica se a string contém caracteres "estranhos" (fontes personalizadas,
+ * zalgo, marcas de combinação, símbolos exóticos/ornamentais)
+ * @param {string} str
+ * @returns {boolean}
+ */
+function hasStrangeCharacters(str) {
+	if (!str) return false;
+
+	// 1. Math Alphanumeric Symbols (e.g. 𝖲, 𝗔, 𝖫, 𝖵, 🄐, 𝕾, 𝗤, 𝔄, 𝓐)
+	const mathAndEnclosed = /[\u{1D400}-\u{1D7FF}\u{2460}-\u{24FF}\u{1F100}-\u{1F1FF}]/u;
+	if (mathAndEnclosed.test(str)) return true;
+	// 2. Combining marks (strikethrough, underline, Zalgo, Arabic combining marks, etc.)
+	/* eslint-disable no-misleading-character-class */
+	const combiningMarks =
+		/[\u0300-\u036F\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06EC]/;
+	/* eslint-enable no-misleading-character-class */
+	if (combiningMarks.test(str)) return true;
+
+	// 3. Specific decorative/exotic symbols commonly used in fancy nickname formatting:
+	const exoticOrOrnamental =
+		/[\u0F00-\u0FFF\u0A00-\u0A7F\u2C80-\u2CFF\u2700-\u27BF\u2500-\u25FF\u2600-\u26FF\u2200-\u22FF\u2300-\u23FF\u{10650}-\u{10660}]/u;
+	if (exoticOrOrnamental.test(str)) return true;
+
+	return false;
+}
+
 /**
  * Gerencia o sistema de convites para o bot
  * * Fluxo de trabalho:
@@ -71,7 +100,7 @@ class InviteSystem {
 				if (currentTime - lastNotify > 7 * 24 * 60 * 60 * 1000) {
 					await this.bot.sendMessage(
 						message.author,
-						"🛑 A ravenabot não está mais recebendo convites de seu número, pois você foi bloqueado."
+						`🛑 A ${this.bot.nomeExibir || "ravenabot"} não está mais recebendo convites de seu número, pois você foi bloqueado.`
 					);
 					// if (this.bot.grupoInvites) {
 					// 	await this.bot.sendMessage(
@@ -92,7 +121,7 @@ class InviteSystem {
 				message.origin.react("🛑");
 				await this.bot.sendMessage(
 					message.author,
-					"🛑 A ravenabot não recebe mais convite deste grupo, pois ele foi bloqueado."
+					`🛑 A ${this.bot.nomeExibir || "ravenabot"} não recebe mais convite deste grupo, pois ele foi bloqueado.`
 				);
 
 				// if (this.bot.grupoInvites) {
@@ -208,32 +237,174 @@ class InviteSystem {
 			// Verifica se o usuário tem uma solicitação pendente
 			if (!this.pendingRequests.has(message.author)) return false;
 
-			const text = message.type === "text" ? message.content : message.caption;
+			// Somente mensagens de texto são consideradas como motivo
+			if (message.type !== "text") return false;
+			const text = message.content;
 			if (!text) return false;
 
 			const requestData = this.pendingRequests.get(message.author);
-			const { inviteCode, inviteLink, timeout, verificationCode, preConviteContent } = requestData;
-
-			// Limpa o timeout
-			clearTimeout(timeout);
-			this.pendingRequests.delete(message.author);
-
-			// Trata o convite com o motivo fornecido
-			await this.handleInviteRequest(
-				message.author,
+			const {
 				inviteCode,
 				inviteLink,
-				text,
-				message,
+				timeout,
 				verificationCode,
-				preConviteContent
-			);
+				preConviteContent,
+				accumulatedMessages
+			} = requestData;
+
+			// 1. Verifica se enviou o código de verificação — ainda processado imediatamente
+			if (verificationCode && text.trim().toLowerCase() === verificationCode.toLowerCase()) {
+				clearTimeout(timeout);
+				if (requestData.accumulationTimeout) clearTimeout(requestData.accumulationTimeout);
+				this.pendingRequests.delete(message.author);
+				await this.handleInviteRequest(
+					message.author,
+					inviteCode,
+					inviteLink,
+					text,
+					message,
+					verificationCode,
+					preConviteContent
+				);
+				return true;
+			}
+
+			// 2. Se já está acumulando mensagens, apenas adiciona ao buffer
+			if (accumulatedMessages) {
+				accumulatedMessages.push(text.trim());
+				// Atualiza o requestData (array é mutável, mas mantemos a referência)
+				this.pendingRequests.set(message.author, { ...requestData, accumulatedMessages });
+				return true;
+			}
+
+			// 3. Primeira mensagem de motivo: cancela o timeout de 5 min e inicia acumulação de 30s
+			clearTimeout(timeout);
+
+			const newAccumulatedMessages = [text.trim()];
+
+			const accumulationTimeoutId = setTimeout(() => {
+				this._processAccumulatedReason(message.author, message).catch((err) =>
+					this.logger.error("Erro ao processar motivo acumulado:", err)
+				);
+			}, 30 * 1000);
+
+			this.pendingRequests.set(message.author, {
+				...requestData,
+				timeout: null,
+				accumulatedMessages: newAccumulatedMessages,
+				accumulationTimeout: accumulationTimeoutId
+			});
 
 			return true;
 		} catch (error) {
 			this.logger.error("Erro ao processar mensagem de acompanhamento de convite:", error);
 			return false;
 		}
+	}
+
+	/**
+	 * Processa o motivo acumulado após o período de 30 segundos
+	 * @param {string} authorId - ID do usuário
+	 * @param {Object} originalMessage - Objeto da primeira mensagem de motivo
+	 */
+	async _processAccumulatedReason(authorId, originalMessage) {
+		const requestData = this.pendingRequests.get(authorId);
+		if (!requestData) return;
+
+		const {
+			inviteCode,
+			inviteLink,
+			verificationCode,
+			preConviteContent,
+			accumulatedMessages,
+			secondChance
+		} = requestData;
+
+		const reason = (accumulatedMessages || []).join("\n").trim();
+
+		// Sem motivo algum
+		if (!reason) {
+			this.pendingRequests.delete(authorId);
+			await this.handleInviteRequest(
+				authorId,
+				inviteCode,
+				inviteLink,
+				"Nenhum motivo fornecido",
+				originalMessage,
+				verificationCode,
+				preConviteContent
+			);
+			return;
+		}
+
+		// Verifica se o motivo é muito curto
+		if (reason.length < MIN_REASON_LENGTH) {
+			if (!secondChance) {
+				// Primeira tentativa curta: dá segunda chance com nova janela de 30s
+				const secondChanceMsg =
+					`O motivo é apenas um filtro inicial pro criador analisar se seu grupo não vai fazer mau uso do bot. Não precisa ser nada absurdo, mas escreve pelo menos ${MIN_REASON_LENGTH} caracteres aí!\n\n` +
+					"Vou te dar mais uma chance.";
+
+				await this.bot.sendMessage(authorId, secondChanceMsg);
+
+				// Nova janela de acumulação de 30s para a segunda chance
+				const accumulationTimeoutId = setTimeout(() => {
+					this._processAccumulatedReason(authorId, originalMessage).catch((err) =>
+						this.logger.error("Erro ao processar motivo acumulado (2ª chance):", err)
+					);
+				}, 30 * 1000);
+
+				this.pendingRequests.set(authorId, {
+					...requestData,
+					secondChance: true,
+					accumulatedMessages: [],
+					accumulationTimeout: accumulationTimeoutId,
+					timeout: null
+				});
+				return;
+			} else {
+				// Segunda tentativa curta: aplica cooldown estendido e descarta
+				this.pendingRequests.delete(authorId);
+
+				try {
+					const ignoredPath = path.join(
+						this.database.databasePath,
+						"textos",
+						"invite_ignorado.txt"
+					);
+					const ignoredText = await fs
+						.readFile(ignoredPath, "utf8")
+						.catch(
+							() =>
+								"Parece que ler e escrever não é seu forte, né? Seu convite _não foi registrado_ e suas próximas requisições serão ignoradas durante algumas horas."
+						);
+					await this.bot.sendMessage(authorId, ignoredText);
+				} catch (err) {
+					await this.bot.sendMessage(
+						authorId,
+						"Parece que ler e escrever não é seu forte, né? Seu convite _não foi registrado_ e suas próximas requisições serão ignoradas durante algumas horas."
+					);
+				}
+
+				const punishDuration = 10 * this.inviteCooldown * 60 * 1000;
+				const normalDuration = this.inviteCooldown * 60 * 1000;
+				const futureTime = Date.now() + punishDuration - normalDuration;
+				this.userCooldowns.set(authorId, futureTime);
+				return;
+			}
+		}
+
+		// Motivo válido: processa o convite com todas as mensagens acumuladas
+		this.pendingRequests.delete(authorId);
+		await this.handleInviteRequest(
+			authorId,
+			inviteCode,
+			inviteLink,
+			reason,
+			originalMessage,
+			verificationCode,
+			preConviteContent
+		);
 	}
 
 	/**
@@ -389,7 +560,7 @@ class InviteSystem {
 						this.logger.info(`Ignorando convite de JID bloqueado: ${inviteInfoData.JID}`);
 						await this.bot.sendMessage(
 							authorId,
-							"🛑 A ravenabot não recebe mais convite deste grupo, pois ele foi bloqueado."
+							`🛑 A ${this.bot.nomeExibir || "ravenabot"} não recebe mais convite deste grupo, pois ele foi bloqueado.`
 						);
 
 						// if (this.bot.grupoInvites) {
@@ -446,13 +617,50 @@ class InviteSystem {
 				authorName: userName
 			});
 
+			await this.database.addInviteHistory({
+				code: inviteCode,
+				groupJid: inviteInfoData?.JID || null,
+				authorId,
+				authorName: userName,
+				timestamp: Date.now(),
+				reason
+			});
+
 			// Envia notificação para o usuário
+			let extraText = "";
+			let addedAny = false;
+
+			if (inviteInfoData?.ParticipantCount !== undefined && inviteInfoData.ParticipantCount <= 2) {
+				const botName = this.bot.nomeExibir || "ravena";
+				extraText += `\n- 😪 Este parece ser um grupo particular. Lembre-se que a ${botName} faz tudo no PV, não tem necessidade de criar um grupo com ela! Se quiser só brincar com os comandos, que tal entrar na nossa comunidade? Envie !grupao - temos grupos de downloads, jogos e bate papo.`;
+				addedAny = true;
+			}
+
+			if (
+				(inviteInfoData?.Name && hasStrangeCharacters(inviteInfoData.Name)) ||
+				(userName && hasStrangeCharacters(userName))
+			) {
+				extraText +=
+					"\n- ⛔️ *Evito* grupos e pessoas com esses caracteres estranhos, pois geralmente são crianças.";
+				addedAny = true;
+			}
+
+			if (inviteInfoData && this.isCommunity(inviteInfoData)) {
+				extraText +=
+					"\n- 👎 *Não consigo* entrar em comunidade, você vai precisar mandar o convite do grupo em específico que eu devo entrar.";
+				addedAny = true;
+			}
+
+			if (addedAny) {
+				extraText += "\n- 🧾 *!convite* para saber mais.";
+			}
+
 			const invitesPosPath = path.join(this.database.databasePath, "textos", "invites_pos.txt");
 			const posConvite = await fs.readFile(invitesPosPath, "utf8");
 
 			await this.bot.sendMessage(
 				authorId,
-				"Seu convite foi recebido e será analisado." + posConvite
+				"Seu convite foi recebido e será analisado." + extraText + posConvite
 			);
 
 			// Envia notificações para o grupoInvites se configurado
@@ -494,11 +702,11 @@ class InviteSystem {
 						this.logger.error("Erro ao verificar se o autor é doador:", donationError);
 					}
 
-					// Monta a mensagem final com as infos novas
 					let infoMessageHeader = `📩 *Nova Solicitação de Convite de Grupo*\n\n`;
 					if (isDonator) {
 						infoMessageHeader = `💸💸 R$${donateValue} 💸💸\n` + infoMessageHeader;
 					}
+					const ownerMark = ownerMatch ? " ✅" : "";
 
 					let botWarning = "";
 					if (otherBotsInGroup.length > 0) {
@@ -506,7 +714,95 @@ class InviteSystem {
 						botWarning = `\n⚠️ *Bot ${botsStr} Já está neste grupo!*`;
 					}
 
-					const ownerMark = ownerMatch ? " ✅" : "";
+					// Fetch Invite statistics
+					let wasInGroupBefore = false;
+					if (inviteInfoData?.JID) {
+						try {
+							const existingGroup = await this.database.getGroup(inviteInfoData.JID);
+							if (existingGroup) {
+								wasInGroupBefore = true;
+							}
+						} catch (groupCheckErr) {
+							this.logger.warn(`Erro ao verificar grupo na base: ${groupCheckErr.message}`);
+						}
+					}
+
+					let authorInvitesCount = 0;
+					let groupInvitesCount = 0;
+					let otherInvitersText = "";
+					let membershipHistoryText = "";
+
+					try {
+						const authorInvites = await this.database.getInviteHistoryByAuthor(authorId);
+						authorInvitesCount = authorInvites.length;
+					} catch (err) {
+						this.logger.error("Erro ao carregar histórico de convites do autor:", err);
+					}
+
+					try {
+						const groupInvites = await this.database.getInviteHistoryByGroup(
+							inviteInfoData?.JID || null,
+							inviteCode
+						);
+						groupInvitesCount = groupInvites.length;
+
+						const otherInvitersMap = new Map();
+						const cleanCurrentAuthor = authorId.replace(/[^0-9]/g, "");
+						for (const gi of groupInvites) {
+							if (gi.author_id) {
+								const cleanGiAuthor = gi.author_id.replace(/[^0-9]/g, "");
+								if (cleanGiAuthor !== cleanCurrentAuthor) {
+									otherInvitersMap.set(cleanGiAuthor, gi.author_name || "Pessoa");
+								}
+							}
+						}
+						if (otherInvitersMap.size > 0) {
+							const list = Array.from(otherInvitersMap.entries()).map(
+								([num, name]) => `${name} (${num})`
+							);
+							otherInvitersText = `- 👥 *Outros que já indicaram*: ${list.join(", ")}\n`;
+						}
+					} catch (err) {
+						this.logger.error("Erro ao carregar histórico de convites do grupo:", err);
+					}
+
+					if (inviteInfoData?.JID) {
+						try {
+							const periods = await this.database.getGroupMembershipPeriods(inviteInfoData.JID);
+							if (periods && periods.length > 0) {
+								membershipHistoryText = `\n🚪 *Histórico de Estadia no Grupo:*\n`;
+								periods.forEach((p, idx) => {
+									const joinDate = p.join_timestamp
+										? new Date(p.join_timestamp).toLocaleString("pt-BR")
+										: "Desconhecido";
+									const leaveDate = p.leave_timestamp
+										? new Date(p.leave_timestamp).toLocaleString("pt-BR")
+										: "Ainda no grupo";
+
+									let durationText = "";
+									if (p.duration) {
+										const sec = Math.floor(p.duration / 1000);
+										const days = Math.floor(sec / 86400);
+										const hours = Math.floor((sec % 86400) / 3600);
+										const minutes = Math.floor((sec % 3600) / 60);
+
+										const parts = [];
+										if (days > 0) parts.push(`${days}d`);
+										if (hours > 0) parts.push(`${hours}h`);
+										if (minutes > 0) parts.push(`${minutes}m`);
+										if (parts.length === 0) parts.push("menos de 1m");
+										durationText = ` (${parts.join(" ")})`;
+									} else if (p.join_timestamp && p.leave_timestamp) {
+										durationText = " (tempo desconhecido)";
+									}
+
+									membershipHistoryText += `${idx + 1}. 🟢 ${joinDate} até 🔴 ${leaveDate}${durationText}\n`;
+								});
+							}
+						} catch (err) {
+							this.logger.error("Erro ao carregar histórico de estadias:", err);
+						}
+					}
 
 					const infoMessage =
 						infoMessageHeader +
@@ -516,6 +812,11 @@ class InviteSystem {
 						(inviteInfoData?.ParticipantCount
 							? `👥 *Membros*: ${inviteInfoData.ParticipantCount}\n`
 							: "") +
+						(wasInGroupBefore ? `⚠️ Já esteve neste grupo (${inviteInfoData?.JID || ""})\n` : "") +
+						`- 📈 *Convites deste usuário*: ${authorInvitesCount}\n` +
+						`- 📊 *Vezes que este grupo foi indicado*: ${groupInvitesCount}\n` +
+						otherInvitersText +
+						membershipHistoryText +
 						`\n💬 *Motivo:*\n${reason}\n` +
 						botWarning +
 						(isDonator ? `\n💸💸${this.rndString()}💸💸` : `\n${this.rndString()}`);
@@ -547,8 +848,9 @@ class InviteSystem {
 	 */
 	destroy() {
 		// Limpa todos os timeouts pendentes
-		for (const { timeout } of this.pendingRequests.values()) {
+		for (const { timeout, accumulationTimeout } of this.pendingRequests.values()) {
 			clearTimeout(timeout);
+			if (accumulationTimeout) clearTimeout(accumulationTimeout);
 		}
 		this.pendingRequests.clear();
 		this.userCooldowns.clear(); // Limpa também o mapa de cooldowns de usuário

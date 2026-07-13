@@ -255,9 +255,14 @@ async function aiCommand(bot, message, args, group) {
 	const database = Database.getInstance();
 
 	// 1. Get Base Context and Lists
-	const ctxPath = path.join(database.databasePath, "textos", "llm_context.txt");
+	let baseCtxContent;
+	if (bot.aiPersonality && bot.aiPersonality.trim().length > 0) {
+		baseCtxContent = bot.aiPersonality;
+	} else {
+		const ctxPath = path.join(database.databasePath, "textos", "llm_context.txt");
+		baseCtxContent = (await fs.readFile(ctxPath, "utf8")) || "";
+	}
 	const botCtxPath = path.join(database.databasePath, "textos", "llm_bot_context.txt");
-	const baseCtxContent = (await fs.readFile(ctxPath, "utf8")) || "";
 	const botCtxContent = (await fs.readFile(botCtxPath, "utf8")) || "";
 
 	const { cmdSimpleList, cmdGerenciaSimplesList } = getCommandLists(bot, group);
@@ -272,15 +277,15 @@ async function aiCommand(bot, message, args, group) {
 		}
 	}
 
-	// 3. Check for Media
-	const media = await getMediaFromMessage(message);
+	// 3. Check for Media (direct or from quoted message)
+	const { media, hadQuoted, quotedHadMedia } = await getMediaFromMessage(message);
 
 	// Validation: No media and short question
 	if (!media && question.length < 5) {
 		if (bot.pvAI) {
 			const greetingPath = path.join(database.databasePath, "textos", "bot-greeting.txt");
 			const greetingContent =
-				(await fs.readFile(greetingPath, "utf8")) ?? "Oi, eu sou a ravenabot!";
+				(await fs.readFile(greetingPath, "utf8")) ?? `Oi, eu sou ${bot.nomeExibir || "ravenabot"}!`;
 			return new ReturnMessage({
 				chatId,
 				content: greetingContent,
@@ -342,6 +347,20 @@ async function aiCommand(bot, message, args, group) {
 		);
 	}
 
+	// CASE B1: Had a quoted message with media but couldn't recover it (cache expired or download failed)
+	// Only trigger when the quoted message was confirmed to have media (quotedHadMedia=true)
+	// or when the quoted message couldn't be retrieved from cache at all (quotedHadMedia=null)
+	if (hadQuoted && !media && quotedHadMedia !== false) {
+		return new ReturnMessage({
+			chatId,
+			content:
+				"⚠️ Não foi possível recuperar a mídia da mensagem marcada. Ela pode ter saído do cache ou o download falhou.",
+			options: {
+				quotedMessageId: message.origin.id._serialized,
+				goReply: message.origin
+			}
+		});
+	}
 	// CASE C: Text-Only Response (General, Group, Bot-chat)
 	// Build Context based on Classification
 	let systemContext = "";
@@ -464,10 +483,16 @@ async function handleMediaRequest(
 		}
 		completionOptions.image = media.data;
 
-		const ctxPath = path.join(database.databasePath, "textos", "llm_context_images.txt");
-		completionOptions.systemContext =
-			(await fs.readFile(ctxPath, "utf8")) ??
-			"Você se chama ravenabot e deve interpretar esta imagem enviada no WhatsApp";
+		if (bot.aiPersonality && bot.aiPersonality.trim().length > 0) {
+			completionOptions.systemContext =
+				bot.aiPersonality +
+				"\n\nSuas mensagens são processadas e enviadas pelo WhatsApp.\n\nO seu objetivo agora é analisar o conteúdo de imagem recebida, atendendo o que o usuário pediu no prompt (caso exista).";
+		} else {
+			const ctxPath = path.join(database.databasePath, "textos", "llm_context_images.txt");
+			completionOptions.systemContext =
+				(await fs.readFile(ctxPath, "utf8")) ??
+				`Você se chama ${bot.nomeExibir || "ravenabot"} e deve interpretar esta imagem enviada no WhatsApp`;
+		}
 		completionOptions.systemContext += customPersonalidade;
 	} else if (media.mimetype.includes("video")) {
 		tipoMedia = "Video";
@@ -497,10 +522,16 @@ async function handleMediaRequest(
 			completionOptions.images = frames;
 			completionOptions.timeout = 60000;
 
-			const ctxPath = path.join(database.databasePath, "textos", "llm_context_videos.txt");
-			completionOptions.systemContext =
-				(await fs.readFile(ctxPath, "utf8")) ??
-				"Você se chama ravenabot e deve interpretar este vídeo enviado no WhatsApp";
+			if (bot.aiPersonality && bot.aiPersonality.trim().length > 0) {
+				completionOptions.systemContext =
+					bot.aiPersonality +
+					"\n\nSuas mensagens são processadas e enviadas pelo WhatsApp.\n\nO seu objetivo agora é analisar o conteúdo do vídeo recebido, atendendo o que o usuário pediu no prompt (caso exista).";
+			} else {
+				const ctxPath = path.join(database.databasePath, "textos", "llm_context_videos.txt");
+				completionOptions.systemContext =
+					(await fs.readFile(ctxPath, "utf8")) ??
+					`Você se chama ${bot.nomeExibir || "ravenabot"} e deve interpretar este vídeo enviado no WhatsApp`;
+			}
 			completionOptions.systemContext += customPersonalidade;
 		} catch (videoError) {
 			logger.error("[aiCommand] Error processing video:", videoError);
@@ -585,32 +616,46 @@ async function handleMediaRequest(
 	}
 }
 
-// Auxiliar para obter mídia da mensagem
-function getMediaFromMessage(message) {
-	return new Promise((resolve, reject) => {
-		// Se a mensagem tem mídia direta
-		if (message.type !== "text") {
-			resolve(message.content);
-			return;
+// Auxiliar para obter mídia da mensagem.
+// Retorna { media, hadQuoted, quotedHadMedia } onde:
+//   hadQuoted: havia uma mensagem citada (mesmo que não fosse recuperável)
+//   quotedHadMedia: a mensagem citada recuperada tinha mídia (mas o download falhou), ou null se não foi possível recuperar a mensagem citada
+async function getMediaFromMessage(message) {
+	// Se a mensagem tem mídia direta
+	if (message.type !== "text") {
+		// Lazy loading: content existe mas sem base64 (otimização de RAM)
+		if (message.content && message.content.data) {
+			return { media: message.content, hadQuoted: false, quotedHadMedia: false };
 		}
+		if (typeof message.downloadMedia === "function") {
+			try {
+				const media = await message.downloadMedia();
+				return { media, hadQuoted: false, quotedHadMedia: false };
+			} catch (e) {
+				logger.error("[getMediaFromMessage] Erro ao baixar mídia:", e);
+				return { media: null, hadQuoted: false, quotedHadMedia: false };
+			}
+		}
+		return { media: message.content ?? null, hadQuoted: false, quotedHadMedia: false };
+	}
 
-		// Tenta obter mídia da mensagem citada
-		message.origin
-			.getQuotedMessage()
-			.then((quotedMsg) => {
-				if (quotedMsg && quotedMsg.hasMedia) {
-					return quotedMsg.downloadMedia();
-				}
-				resolve(null);
-			})
-			.then((media) => {
-				if (media) resolve(media);
-			})
-			.catch((error) => {
-				logger.error("Erro ao obter mídia da mensagem citada:", error);
-				resolve(null);
-			});
-	});
+	// Verifica se havia uma mensagem citada (antes de tentar recuperá-la do cache)
+	const hadQuoted = !!message.hasQuotedMsg;
+
+	// Tenta obter mídia da mensagem citada
+	try {
+		const quotedMsg = await message.origin.getQuotedMessage();
+		if (quotedMsg && quotedMsg.hasMedia) {
+			const media = await quotedMsg.downloadMedia();
+			// quotedHadMedia=true: a mensagem citada existe e tem mídia (download pode ter falhado)
+			return { media, hadQuoted, quotedHadMedia: true };
+		}
+		// Quoted msg exists but has no media (or couldn't be recovered from cache)
+		return { media: null, hadQuoted, quotedHadMedia: quotedMsg ? false : null };
+	} catch (error) {
+		logger.error("Erro ao obter mídia da mensagem citada:", error);
+	}
+	return { media: null, hadQuoted, quotedHadMedia: null };
 }
 
 const commands = [

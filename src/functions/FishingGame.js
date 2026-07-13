@@ -2,11 +2,12 @@
 const path = require("path");
 const fs = require("fs").promises;
 const fsSync = require("fs");
+const { createCanvas, loadImage, registerFont } = require("canvas");
 const Logger = require("../utils/Logger");
 const Command = require("../models/Command");
 const Database = require("../utils/Database");
 const AdminUtils = require("../utils/AdminUtils");
-const sdModule = require("./ComfyUICommands");
+const bonsaiModule = require("./BonsaiCommands");
 const ReturnMessage = require("../models/ReturnMessage");
 
 const logger = new Logger("fishing-game");
@@ -104,6 +105,12 @@ database.getSQLiteDb(
 	} catch (e) {
 		// Ignore if column already exists
 	}
+	try {
+		const fontsDir = path.join(database.databasePath, "fonts");
+		await fs.mkdir(fontsDir, { recursive: true });
+	} catch (e) {
+		// Ignore
+	}
 })();
 
 // --- CONSTANTES DO JOGO ---
@@ -126,7 +133,7 @@ const weightScaleMsgs = [180, 150, 120, 100, 80, 60];
 const RARE_FISH = [
 	{
 		name: "Cthulhu",
-		chance: 0.000002,
+		chance: 0.000003,
 		monthlyLimit: 1,
 		weightBonus: 26665,
 		emoji: "🐙",
@@ -134,7 +141,7 @@ const RARE_FISH = [
 	},
 	{
 		name: "Jörmungandr",
-		chance: 0.000003,
+		chance: 0.000005,
 		monthlyLimit: 1,
 		weightBonus: 17200,
 		emoji: "🌏",
@@ -142,7 +149,7 @@ const RARE_FISH = [
 	},
 	{
 		name: "Ryūjin",
-		chance: 0.000007,
+		chance: 0.00001,
 		monthlyLimit: 1,
 		weightBonus: 12050,
 		emoji: "⛩️",
@@ -150,7 +157,7 @@ const RARE_FISH = [
 	},
 	{
 		name: "Dai Gum Loong",
-		chance: 0.000008,
+		chance: 0.00001,
 		monthlyLimit: 1,
 		weightBonus: 9100,
 		emoji: "🐲",
@@ -158,7 +165,7 @@ const RARE_FISH = [
 	},
 	{
 		name: "Godzilla",
-		chance: 0.000009,
+		chance: 0.00001,
 		monthlyLimit: 1,
 		weightBonus: 8190,
 		emoji: "🦖",
@@ -175,7 +182,7 @@ const RARE_FISH = [
 	},
 	{
 		name: "Bakunawa",
-		chance: 0.000011,
+		chance: 0.000015,
 		monthlyLimit: 1,
 		weightBonus: 7020,
 		emoji: "🌑",
@@ -184,7 +191,7 @@ const RARE_FISH = [
 	},
 	{
 		name: "Hydra",
-		chance: 0.000012,
+		chance: 0.000015,
 		monthlyLimit: 1,
 		weightBonus: 5005,
 		emoji: "🐍",
@@ -193,7 +200,7 @@ const RARE_FISH = [
 	},
 	{
 		name: "Charybdis",
-		chance: 0.000013,
+		chance: 0.000015,
 		monthlyLimit: 1,
 		weightBonus: 5980,
 		emoji: "⌛️",
@@ -280,7 +287,7 @@ const RARE_FISH = [
 	{
 		name: "Sedna",
 		chance: 0.000045,
-		monthlyLimit: 2,
+		monthlyLimit: 1,
 		weightBonus: 1690,
 		emoji: "🧜‍♀️",
 		description:
@@ -289,7 +296,7 @@ const RARE_FISH = [
 	{
 		name: "Baleia",
 		chance: 0.00005,
-		monthlyLimit: 3,
+		monthlyLimit: 2,
 		weightBonus: 1200,
 		emoji: "🐋",
 		description: "majestic giant blue whale, immense scale, barnacles on skin, graceful movement"
@@ -588,7 +595,7 @@ const DEFAULT_GLOBAL_FACTORS = {
 	trashChance: 1.0,
 	buffChance: 1.0,
 	debuffChance: 0.8,
-	rareFishChance: 1.5,
+	rareFishChance: 1.65,
 	weightFactor: 1.0
 };
 
@@ -1302,6 +1309,76 @@ function getCurrentDateTime() {
 	return new Intl.DateTimeFormat("en-GB", options).format(now).replace(",", "");
 }
 
+let fontRegistered = false;
+function registerCustomFont() {
+	if (fontRegistered) return;
+	const fontPath = path.join(database.databasePath, "fonts", "FishingFont.ttf");
+	try {
+		if (fsSync.existsSync(fontPath)) {
+			registerFont(fontPath, { family: "FishingFont" });
+			fontRegistered = true;
+		}
+	} catch (err) {
+		logger.error("Erro ao registrar fonte para peixe raro:", err);
+	}
+}
+
+async function drawTextOnRareFishImage(mediaContent, fishName, fishWeight, dateString) {
+	try {
+		if (!mediaContent || !mediaContent.data) {
+			return mediaContent;
+		}
+
+		registerCustomFont();
+
+		const imgBuffer = Buffer.from(mediaContent.data, "base64");
+		const img = await loadImage(imgBuffer);
+		const width = img.width;
+		const height = img.height;
+
+		const canvas = createCanvas(width, height);
+		const ctx = canvas.getContext("2d");
+
+		ctx.drawImage(img, 0, 0);
+
+		const line1 = `${fishName}, ${fishWeight.toFixed(2)}kg`;
+		const line2 = dateString;
+
+		const fontSize = Math.floor(width * 0.065);
+		const strokeWidth = Math.floor(width * 0.01);
+
+		const fontFamily = fontRegistered ? "FishingFont" : "Impact";
+		ctx.font = `bold ${fontSize}px ${fontFamily}`;
+		ctx.textAlign = "center";
+		ctx.textBaseline = "middle";
+
+		ctx.strokeStyle = "black";
+		ctx.lineWidth = strokeWidth;
+		ctx.lineJoin = "round";
+		ctx.fillStyle = "white";
+
+		const y1 = Math.floor(height * 0.88);
+		const y2 = Math.floor(height * 0.94);
+
+		ctx.strokeText(line1, width / 2, y1);
+		ctx.fillText(line1, width / 2, y1);
+
+		ctx.strokeText(line2, width / 2, y2);
+		ctx.fillText(line2, width / 2, y2);
+
+		const outputBuffer = canvas.toBuffer("image/jpeg", { quality: 0.9 });
+
+		mediaContent.data = outputBuffer.toString("base64");
+		mediaContent.size = outputBuffer.length;
+		delete mediaContent.url;
+		mediaContent.source = "base64";
+		return mediaContent;
+	} catch (error) {
+		logger.error("Erro ao desenhar texto na imagem do peixe raro:", error);
+		return mediaContent;
+	}
+}
+
 async function generateRareFishImage(
 	bot,
 	userName,
@@ -1317,9 +1394,7 @@ Person named '${userName}' fishing an epically rare monstrous creature (fantasy)
 
 Sweat and tears, joy
 Epic scenario, huge boats, creature captured mythical, fantastic, water splashing
-Dynamic, action-ready close-up composition, medium depth-of-field, hyper-detailed photorealistic-anime hybrid style, epic survival and exploration atmosphere.
-
-((Write text in bottom of image centered, bold font, fantasy: ${fishName}, ${fishWeight.toFixed(2)}kg @ ${dateString}))`;
+Dynamic, action-ready close-up composition, medium depth-of-field, hyper-detailed photorealistic-anime hybrid style, epic survival and exploration atmosphere.`;
 
 		const mockMessage = {
 			author: "SYSTEM",
@@ -1331,9 +1406,9 @@ Dynamic, action-ready close-up composition, medium depth-of-field, hyper-detaile
 			}
 		};
 
-		if (!sdModule || !sdModule.generateImage) return null;
+		if (!bonsaiModule || !bonsaiModule.generateImage) return null;
 
-		const result = await sdModule.generateImage(
+		const result = await bonsaiModule.generateImage(
 			bot,
 			mockMessage,
 			prompt,
@@ -1341,7 +1416,22 @@ Dynamic, action-ready close-up composition, medium depth-of-field, hyper-detaile
 			true,
 			{ skipNSFW: true, isProgrammatic: true }
 		);
-		return result && result.content && result.content.mimetype ? result.content : null;
+
+		if (!result || !result.content || !result.content.mimetype) return null;
+
+		// Inject the text onto the image
+		try {
+			const processedMedia = await drawTextOnRareFishImage(
+				result.content,
+				fishName,
+				fishWeight,
+				dateString
+			);
+			return processedMedia;
+		} catch (drawError) {
+			logger.error("Erro ao desenhar texto no peixe raro, retornando original:", drawError);
+			return result.content;
+		}
 	} catch (error) {
 		logger.error("Erro ao gerar imagem para peixe raro:", error);
 		return null;
@@ -1786,6 +1876,10 @@ async function fishCommand(bot, message, args, group) {
 
 		fishMessage += `\n> 🐛 Iscas restantes: ${userData.baits}/${getMaxBaits(userData)}`;
 
+		if (caughtFishes.length === 1 && caughtFishes[0].isRare) {
+			fishMessage += `\n> 🐲 *Galeria de lendários:* ✨ https://ravena.moothz.win/pesca`;
+		}
+
 		fishMessage += effectMessage;
 		// Se for peixe raro, tentar gerar imagem e salvar no histórico
 		if (caughtFishes.length === 1 && caughtFishes[0].isRare) {
@@ -1834,7 +1928,7 @@ async function fishCommand(bot, message, args, group) {
 			const notificacaoPeixeRaro = new ReturnMessage({
 				content: rareFishImage,
 				options: {
-					caption: `🏆 *${userName}* capturou um(a) _*${caughtFishes[0].name}* LENDÁRIO(A)_ pesando *${caughtFishes[0].weight.toFixed(2)} kg* no grupo "${groupName}"! (${caughtFishes[0].emoji} ${chanceFinal}% de chance)\n\n> ${bot.id}`
+					caption: `🏆 *${userName}* capturou um(a) _*${caughtFishes[0].name}* LENDÁRIO(A)_ pesando *${caughtFishes[0].weight.toFixed(2)} kg* no grupo "${groupName}"! (${caughtFishes[0].emoji} ${chanceFinal}% de chance)\n\n> 🐲 *Galeria de lendários:* ✨ https://ravena.moothz.win/pesca\n\n> ${bot.id}`
 				}
 			});
 
@@ -2069,6 +2163,9 @@ async function legendaryFishCommand(bot, message, args, group) {
 			textMessage += `   Data: ${date}\n\n`;
 		}
 
+		const botDomain = process.env.BOT_DOMAIN || "https://ravena.moothz.win";
+		textMessage += `_Veja a galeria completa com imagens em:_\n🔗 ${botDomain}/pesca`;
+
 		const messages = [];
 		messages.push(new ReturnMessage({ chatId, content: textMessage }));
 
@@ -2285,6 +2382,9 @@ async function fishingInfoCommand(bot, message) {
 		if (stats.mostFishCaughtByUser.totalCatches > 0) {
 			infoMessage += `🥇 *Pescador Mais Dedicado:* _${stats.mostFishCaughtByUser.userName}_ com \`${stats.mostFishCaughtByUser.totalCatches}\` peixes pescados\n`;
 		}
+
+		const botDomain = process.env.BOT_DOMAIN || "https://ravena.moothz.win";
+		infoMessage += `\n_Veja a galeria completa em:_\n🔗 ${botDomain}/pesca`;
 
 		return new ReturnMessage({ chatId, content: infoMessage });
 	} catch (error) {

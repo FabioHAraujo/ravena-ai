@@ -146,8 +146,12 @@ data/textos/archive.txt
 /src/scripts
 /old
 /.Trash-1000
-test-*
+test-output-*
 *.swp
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Ravena data
 bots.json
@@ -190,3 +194,5 @@ data/whatsgoapi/dbdata/main.db-journal
 data/www.youtube.com_cookies.json
 /scratch
 /.antigravitycli
+/data/qrcodes
+data/notified_streams_cache.json

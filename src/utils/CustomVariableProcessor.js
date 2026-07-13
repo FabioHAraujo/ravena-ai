@@ -87,11 +87,102 @@ class CustomVariableProcessor {
 			// Processa variáveis de comando embutido
 			processedText = await this.processEmbeddedCommands(processedText, context);
 
+			// Processa menções implícitas na mensagem final (ex: @5511999999999 ou @33543761703009)
+			if (context && typeof processedText === "string") {
+				const implicitMentions = processedText.matchAll(/@(\d{8,25})/g);
+				const jidsToMention = [];
+				for (const match of Array.from(implicitMentions)) {
+					const num = match[1];
+					const resolved = await this.resolveJids(num, context);
+					for (const r of resolved) {
+						jidsToMention.push(r);
+					}
+				}
+
+				if (jidsToMention.length > 0) {
+					if (!context.options) {
+						context.options = {};
+					}
+					if (!context.options.mentions) {
+						context.options.mentions = [];
+					}
+					for (const jid of jidsToMention) {
+						if (!context.options.mentions.includes(jid)) {
+							context.options.mentions.push(jid);
+						}
+					}
+				}
+			}
+
 			return processedText;
 		} catch (error) {
 			this.logger.error("Erro ao processar variáveis:", error);
 			return text; // Retorna o texto original em caso de erro
 		}
+	}
+
+	/**
+	 * Resolve a numeric ID to the correct JID format (LID or PN)
+	 */
+	async resolveJids(num, context) {
+		if (!context) {
+			if (num.startsWith("3") && num.length >= 14) {
+				return [`${num}@lid`];
+			}
+			return [`${num}@s.whatsapp.net`];
+		}
+
+		// 1. Check if the JID already exists in context.options.mentions
+		if (context.options && context.options.mentions && Array.isArray(context.options.mentions)) {
+			const existing = context.options.mentions.find(
+				(jid) => typeof jid === "string" && jid.split("@")[0] === num
+			);
+			if (existing) {
+				return [existing];
+			}
+		}
+
+		// 2. Check if it matches the message author or authorAlt
+		if (context.message) {
+			if (context.message.author === num) {
+				return [`${num}@s.whatsapp.net`];
+			}
+			if (context.message.authorAlt && context.message.authorAlt.split("@")[0] === num) {
+				return [context.message.authorAlt];
+			}
+		}
+
+		// 3. Check if we can find the JID in group participants
+		const groupId = context.message?.group ?? context.group?.id;
+		if (groupId && context.bot && context.bot.client) {
+			try {
+				const chat = await context.bot.client.getChatById(groupId);
+				if (chat && chat.participants) {
+					const found = chat.participants.find((p) => {
+						const pLid = p.lid?.split("@")[0];
+						const pJid = p.id?._serialized?.split("@")[0];
+						return pLid === num || pJid === num;
+					});
+
+					if (found) {
+						if (found.lid && found.lid.split("@")[0] === num) {
+							return [found.lid];
+						}
+						if (found.id?._serialized && found.id._serialized.split("@")[0] === num) {
+							return [found.id._serialized];
+						}
+					}
+				}
+			} catch (e) {
+				this.logger.error("Erro ao obter chat para resolver JID no grupo:", e);
+			}
+		}
+
+		// 4. Fallback: check prefix/length
+		if (num.startsWith("3") && num.length >= 14) {
+			return [`${num}@lid`];
+		}
+		return [`${num}@s.whatsapp.net`];
 	}
 
 	/**
@@ -389,7 +480,7 @@ class CustomVariableProcessor {
 							try {
 								// Obtém membros que ainda não foram usados
 								const chat = await context.bot.client.getChatById(context.message.group);
-								if (chat && chat.isGroup) {
+								if (chat && chat.isGroup && Array.isArray(chat.participants)) {
 									// Filtra participantes para excluir o próprio bot e menções já usadas
 									const filteredParticipants = chat.participants.filter(
 										(p) =>
@@ -519,22 +610,42 @@ class CustomVariableProcessor {
 		}
 
 		// Processa variáveis de menções específicas {mention-NUMERO}
-		const mentionMatches = text.matchAll(/\{mention-(\d+)/g);
+		const mentionMatches = text.matchAll(/\{mention-([^}]+)\}/g);
 		for (const match of Array.from(mentionMatches)) {
 			const userIdToMention = match[1];
+			const userPart = userIdToMention.split("@")[0];
 
-			// Verifica se o ID é válido
-			if (userIdToMention && userIdToMention.length > 8 && userIdToMention.length < 15) {
-				text = text.replace(match[0] + "}", `@${userIdToMention.split("@")[0]}`);
+			// Verifica se o ID/número é válido
+			if (userPart && userPart.length >= 8 && userPart.length <= 25) {
+				let jidsToAdd = [];
+				if (userIdToMention.includes("@")) {
+					if (userIdToMention.endsWith("@c.us")) {
+						jidsToAdd.push(`${userPart}@s.whatsapp.net`);
+					} else {
+						jidsToAdd.push(userIdToMention);
+					}
+				} else {
+					// Sem domínio: resolve de forma inteligente
+					jidsToAdd = await this.resolveJids(userPart, context);
+				}
 
-				if (context.options && context.options.mentions) {
-					context.options.mentions.push(userIdToMention);
-				} else if (context.options) {
-					context.options.mentions = [userIdToMention];
+				text = text.replace(match[0], `@${userPart}`);
+
+				if (!context.options) {
+					context.options = {};
+				}
+				if (!context.options.mentions) {
+					context.options.mentions = [];
+				}
+
+				for (const jid of jidsToAdd) {
+					if (!context.options.mentions.includes(jid)) {
+						context.options.mentions.push(jid);
+					}
 				}
 			} else {
 				// Remove a variável inválida
-				text = text.replace(match[0] + "}", "");
+				text = text.replace(match[0], "");
 			}
 		}
 

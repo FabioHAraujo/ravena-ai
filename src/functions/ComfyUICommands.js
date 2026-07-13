@@ -145,7 +145,7 @@ function connectWebSocket() {
 }
 
 // Initialize connection
-connectWebSocket();
+// connectWebSocket();
 
 async function handleExecutionSuccess(promptId) {
 	const request = pendingRequests.get(promptId);
@@ -309,6 +309,93 @@ async function queuePrompt(promptText, sampler = "dpmpp_sde", scheduler = "beta"
 }
 
 /**
+ * Tenta obter um prompt refinado a partir de uma imagem + modificações do usuário.
+ * Faz duas chamadas LLM:
+ *   1. Descreve a imagem detalhadamente
+ *   2. Reescreve a descrição aplicando as modificações solicitadas pelo usuário
+ * Retorna null silenciosamente em caso de falha.
+ * @param {Object} message - Dados da mensagem
+ * @param {Object} llmSvc - Instância do LLMService
+ * @param {string} userPrompt - Modificações desejadas pelo usuário
+ * @returns {Promise<string|null>}
+ */
+async function getImageDescriptionForPrompt(message, llmSvc, userPrompt) {
+	try {
+		let imageData = null;
+
+		// Caso 1: mensagem atual é uma imagem com caption contendo o comando
+		if (message.type === "image") {
+			if (message.content?.data) {
+				imageData = message.content.data;
+			} else if (typeof message.downloadMedia === "function") {
+				const media = await message.downloadMedia().catch(() => null);
+				imageData = media?.data ?? null;
+			}
+		}
+
+		// Caso 2: mensagem de texto com imagem quoted
+		if (!imageData && message.hasQuotedMsg) {
+			const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
+			if (quotedMsg && quotedMsg.type === "image") {
+				const media = await quotedMsg.downloadMedia().catch(() => null);
+				imageData = media?.data ?? null;
+			}
+		}
+
+		if (!imageData) return null;
+
+		// 1ª chamada: descreve a imagem detalhadamente
+		logger.info("[getImageDescriptionForPrompt] 1ª chamada LLM: descrevendo imagem");
+		const description = await llmSvc.getCompletion({
+			prompt:
+				"Analyze this image and provide a detailed description for use as an image generation prompt. Include: art style (realistic, cartoon, anime, painting, etc.), color palette, main subjects, mood/atmosphere, lighting, background details, and any notable visual elements. Be descriptive and specific. Answer in English.",
+			systemContext:
+				"You are an expert at describing images for AI image generation prompts. Be detailed, specific and visual.",
+			image: imageData,
+			maxTokens: 300,
+			priority: 4
+		});
+
+		if (
+			!description ||
+			description.includes("Não foi poss") ||
+			description.includes("Ocorreu um erro")
+		) {
+			return null;
+		}
+
+		const baseDescription = description.trim();
+		logger.info(
+			`[getImageDescriptionForPrompt] Descrição obtida: ${baseDescription.substring(0, 80)}...`
+		);
+
+		// 2ª chamada: reescreve a descrição aplicando as modificações do usuário
+		logger.info("[getImageDescriptionForPrompt] 2ª chamada LLM: aplicando modificações");
+		const refinedPrompt = await llmSvc.getCompletion({
+			prompt: `Rewrite the description of this image:\n${baseDescription}\n\nModifications to apply:\n${userPrompt}`,
+			systemContext:
+				"You are an expert at writing image generation prompts. Rewrite the image description incorporating the requested modifications naturally, keeping a cohesive and detailed prompt. Answer in English.",
+			maxTokens: 350,
+			priority: 4
+		});
+
+		if (
+			!refinedPrompt ||
+			refinedPrompt.includes("Não foi poss") ||
+			refinedPrompt.includes("Ocorreu um erro")
+		) {
+			// Fallback: retorna só a descrição base se o refinamento falhar
+			return baseDescription;
+		}
+
+		return refinedPrompt.trim();
+	} catch (e) {
+		logger.warn("[getImageDescriptionForPrompt] Falhou silenciosamente:", e.message);
+		return null;
+	}
+}
+
+/**
  * Gera uma imagem usando ComfyUI
  */
 async function generateImage(bot, message, args, group, skipNotify = true, options = {}) {
@@ -320,13 +407,14 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 	if (options.isProgrammatic) {
 		prompt = Array.isArray(args) ? args.join(" ") : args;
 	} else {
-		const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
+		// Prompt vem da caption (se for imagem) ou dos args (se for texto)
 		prompt = args.join(" ");
-		if (quotedMsg) {
-			const quotedText = quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body;
-			if (quotedText) {
-				prompt += " " + quotedText;
-			}
+
+		// Tenta obter prompt refinado a partir de imagem (na msg atual ou na quoted) + modificações do usuário
+		const imageDescription = await getImageDescriptionForPrompt(message, llmService, prompt);
+		if (imageDescription) {
+			logger.info("[ComfyUICommands] Usando prompt refinado por imagem");
+			prompt = imageDescription;
 		}
 	}
 
@@ -351,22 +439,17 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
 	logger.info(`Gerando imagem com prompt: '${prompt}'`);
 
 	try {
-		if (!skipNotify) {
-			await bot.sendReturnMessages(
-				new ReturnMessage({
-					chatId,
-					content: `📷 Gerando imagem para '${prompt}', isso pode levar alguns segundos...`,
-					reaction: process.env.LOADING_EMOJI ?? "⌛️"
-				}),
-				group
-			);
-		}
+		// Reação inicial de carregamento (assíncrona)
+		message.origin.react(process.env.LOADING_EMOJI ?? "⌛️").catch(() => {});
 
-		message.origin.react(process.env.LOADING_EMOJI ?? "⌛️");
+		const EventHandler = require("../EventHandler");
+		EventHandler.getInstance().emit("activity", { type: "imagine" });
 
-		let safetyMsg = "";
-		if (!options.skipNSFW) {
-			const safetyQuestion = `Act as a permissive content moderator for an image generation AI. Analyze this prompt: "${prompt}".
+		// 1. Promise de Segurança (LLM)
+		const safetyPromise = (async () => {
+			if (options.skipNSFW) return "";
+			try {
+				const safetyQuestion = `Act as a permissive content moderator for an image generation AI. Analyze this prompt: "${prompt}".
 
         Rules for classification:
         1. **SAFE**: 
@@ -384,40 +467,53 @@ async function generateImage(bot, message, args, group, skipNotify = true, optio
         - If UNSAFE due to Child Safety, include "🚨" emojis.
         - Provide a very short reason.`;
 
-			const safetyResponse = await llmService.getCompletion({
-				prompt: safetyQuestion,
-				systemContext: "You are a content safety filter.",
-				priority: 3
-			});
+				const safetyResponse = await llmService.getCompletion({
+					prompt: safetyQuestion,
+					systemContext: "You are a content safety filter.",
+					priority: 3
+				});
 
-			if (
-				safetyResponse.substring(0, 10).toLowerCase().includes("unsafe") ||
-				prompt.toLowerCase().includes("gore")
-			) {
-				const reportMessage = `⚠️ INAPPROPRIATE IMAGE REQUEST ⚠️\nUser: ${message.author}\nName: ${message.authorName || "Unknown"}\nPrompt: ${prompt}\nLLM Response: ${safetyResponse}\n\n!sa-block ${message.author}`;
-				bot.sendMessage(process.env.GRUPO_LOGS, reportMessage);
+				if (
+					safetyResponse.substring(0, 10).toLowerCase().includes("unsafe") ||
+					prompt.toLowerCase().includes("gore")
+				) {
+					const reportMessage = `⚠️ INAPPROPRIATE IMAGE REQUEST ⚠️\nUser: ${message.author}\nName: ${
+						message.authorName || "Unknown"
+					}\nPrompt: ${prompt}\nLLM Response: ${safetyResponse}\n\n!sa-block ${message.author}`;
+					bot.sendMessage(process.env.GRUPO_LOGS, reportMessage);
 
-				safetyMsg =
-					"\n\n> ⚠️ *AVISO*: O conteúdo solicitado é duvidoso. Esta solicitação será revisada pelo administrador e pode resultar em suspensão.";
+					return "\n\n> ⚠️ *AVISO*: O conteúdo solicitado é duvidoso. Esta solicitação será revisada pelo administrador e pode resultar em suspensão.";
+				}
+			} catch (e) {
+				logger.error("Erro na verificação de segurança (LLM):", e);
 			}
-		}
+			return "";
+		})();
 
-		// Inicia cronômetro
-		const startTime = Date.now();
+		// 2. Promise de Geração de Imagem
+		const generationPromise = (async () => {
+			const startTime = Date.now();
+			const sampler = samplers[Math.floor(Math.random() * samplers.length)];
+			const scheduler = schedulers[Math.floor(Math.random() * schedulers.length)];
 
-		const sampler = samplers[Math.floor(Math.random() * samplers.length)];
-		const scheduler = schedulers[Math.floor(Math.random() * schedulers.length)];
+			const buffer = await queuePrompt(prompt + aesthetic, sampler, scheduler);
+			const generationTime = ((Date.now() - startTime) / 1000).toFixed(1);
 
-		// Queue Prompt and Wait for Image
-		const EventHandler = require("../EventHandler");
-		EventHandler.getInstance().emit("activity", { type: "imagine" });
-		let imageBuffer = await queuePrompt(prompt + aesthetic, sampler, scheduler);
+			return {
+				imageBuffer: buffer,
+				generationTime,
+				sampler,
+				scheduler
+			};
+		})();
+
+		// Aguarda ambos em paralelo
+		const [safetyMsg, genResult] = await Promise.all([safetyPromise, generationPromise]);
+		let { imageBuffer } = genResult;
+		const { generationTime, sampler, scheduler } = genResult;
 
 		// Track stats
 		trackComfyStats("1024x1024", 1, "z-image-turbo-bf16");
-
-		// Calcula o tempo de geração
-		const generationTime = ((Date.now() - startTime) / 1000).toFixed(1);
 
 		// Add Watermark and compress to JPEG
 		try {
@@ -604,4 +700,4 @@ const commands = [
 	})
 ];
 
-module.exports = { commands, generateImage };
+// module.exports = { commands, generateImage };

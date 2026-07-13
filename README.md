@@ -13,6 +13,13 @@ Após muitas versões e adaptações, chegamos na versão atual - tudo concentra
 
 ⚠️ **Atenção**: Bots deste tipo ***não são permitidos*** no whatsapp, então não use em seu número principal - compre um chip só pra isso.
 
+## 🐦‍⬛ Quero usar agora!
+
+Se você quer interagir com o bot e testar ele, eu disponibilizo o mesmo _gratuitamente_ em alguns números, você pode conferir o status dos bots [aqui neste link](https://ravena.moothz.win/)
+
+- **Discord Bot**: Adicione a ravena no seu servidor [através deste link](https://discord.com/oauth2/authorize?client_id=1434519453416030369&permissions=5136918325222464&integration_type=0&scope=bot+applications.commands) _(BETA)_.
+- **Telegram Bot**: Também dou suporte para o Telegram _(mas não muito)_, rodando o bot [ravenosabot](https://t.me/ravenosabot) e o grupo da [comunidade](https://t.me/+x242TMlPD4s2OTVh).
+
 ## 🛠️ Dependências e Funcionalidades
 
 ### 1. Funções Nativas (Prontas para uso via Docker)
@@ -27,7 +34,7 @@ Tudo isso aqui vem pronto e você não precisa configurar nada externo (utiliza 
 ### 2. APIs Self-Hosted (Configuráveis no .env)
 Se você quiser estas funcionalidades no bot, terá que hospedar estes serviços você mesmo e informar a URL nas configurações.
 - **Inteligência Artificial:** Integração com Ollama, LM Studio ou AnythingLLM (Comandos de chat, OCR e resumos). _Dica: Pra pouco uso, é melhor usar uma IA grátis na nuvem como o Gemini Flash._
-- **Voz e Transcrição:** Suporte a Whisper API (Transcrição automática) e AllTalk/XTTS (Sintetização de vozes personalizadas).
+- **Voz e Transcrição:** Suporte a Whisper API (Transcrição automática) e [F5-TTS](https://github.com/SWivid/F5-TTS) via [docker moothz/f5-tts](https://github.com/moothz/f5-tts) (Sintetização de vozes personalizadas).
 - **Jogos:** Stop, Tarô e outros jogos usam LLM para funcionar
 
 ### 3. APIs Externas (Token no .env)
@@ -71,11 +78,6 @@ A stack é composta por 5 containers:
 - **Gerenciamento de Grupos**: Ferramentas para administradores
 - **Sistema de Convites**: Controle quem pode adicionar o bot a grupos
 - **Interações Automáticas**: O bot pode interagir aleatoriamente com mensagens
-
-## 🐦‍⬛ Quero usar agora!
-
-Se você quer interagir com o bot e testar ele, eu disponibilizo o mesmo _gratuitamente_ em alguns números, você pode conferir o status dos bots [aqui neste link](https://ravena.moothz.win/)
-**Telegram Bot**: Também dou suporte para o Telegram _(mas não muito)_, rodando o bot [ravenosabot](https://t.me/ravenosabot) e o grupo da [comunidade](https://t.me/+x242TMlPD4s2OTVh).
 
 ## 🔧 Como hospedar sua própria ravena
 
@@ -151,16 +153,26 @@ Edite o `bots.json` e adicione cada instância de bot que você quer rodar:
 > ```
 
 > Editou o código fonte (ex: functions)?
-> ```bash
-> make ravena-ai
-> ```
+> 
+> * **Método com Volumes (Recomendado):** Descomente as linhas de volumes de código em `docker-compose.yml` (`./index.js` e `./src`) para refletir as alterações no container instantaneamente, e aplique com:
+>   ```bash
+>   make restart-bot
+>   ```
+> * **Método Interativo:** Copie arquivos novos/editados para o container sem precisar de volumes e sem rebuild:
+>   ```bash
+>   make sync
+>   ```
+> * **Método Tradicional:** Se alterou dependências (`package.json`) ou deseja recriar a imagem (usando cache de camadas via BuildKit):
+>   ```bash
+>   make ravena-ai
+>   ```
 
 
 #### 5. Configure os provedores de API (`service-providers.json`)
 ```bash
 cp service-providers.json.example service-providers.json
 ```
-Este arquivo define as URLs das APIs self-hosted e externos (Whisper, Ollama, AllTalk, Gemini, OpenAI, etc). Se você não usa nenhuma, pode usar um vazio assim:
+Este arquivo define as URLs das APIs self-hosted e externos (Whisper, Ollama, F5-TTS, Gemini, OpenAI, etc). Se você não usa nenhuma, pode usar um vazio assim:
 
 ```json
 {
@@ -168,14 +180,14 @@ Este arquivo define as URLs das APIs self-hosted e externos (Whisper, Ollama, Al
   "whisper": [],
   "comfyui": [],
   "sdwebui": [],
-  "alltalk": []
+  "f5tts": []
 }
 ```
 
 ```json
 [
   { "type": "whisper", "url": "http://meu-servidor:5000" },
-  { "type": "alltalk", "url": "http://meu-servidor:7851" }
+  { "type": "f5tts", "url": "http://meu-servidor:5050", "apiKey": "sua-chave-aqui" }
 ]
 ```
 
@@ -198,32 +210,66 @@ http://localhost:5000/qrcode/meu-bot
 ```
 O login e senha são os valores definidos em `managementUser` e `managementPW` no `bots.josn`.
 
+### 🌐 Fallback Proxy (Evitar erro 502 do Cloudflare)
+
+Quando o bot está reiniciando ou em manutenção, as conexões diretas na porta pública falham e o Cloudflare exibe a tela de erro 502 padrão. Para contornar isso sem precisar de uma conta paga na Cloudflare, foi criado um proxy local em Node.js (gerenciado via **PM2**).
+
+O proxy escuta na porta pública **`5000`** e encaminha o tráfego de forma transparente para a porta **`5001`** (onde o contêiner do bot `ravena-ai` agora roda). Caso o bot caia, o proxy intercepta o erro e renderiza uma página de status estilizada com o motivo da indisponibilidade.
+
+#### Como iniciar o Proxy:
+O proxy roda diretamente no host utilizando o PM2.
+```bash
+# Entre na pasta e inicialize pelo PM2
+cd fallback-proxy
+pm2 start ecosystem.config.json
+
+# Para verificar se está rodando:
+pm2 status
+
+# Para ver os logs:
+pm2 logs ravena-fallback-proxy
+```
+
+#### Motivo Dinâmico de Indisponibilidade:
+* Os scripts do `Makefile` (ex: `make restart-bot`, `make ravena-ai`) escrevem automaticamente o motivo da indisponibilidade em `data/status_motivo.txt`.
+* O **health-check** do Docker também escreve o motivo neste mesmo arquivo caso precise reiniciar o container devido a travamentos ou quedas inesperadas.
+* Assim que o bot inicializa completamente e fica online, ele mesmo limpa o arquivo de motivo. A página do proxy fallback se recarrega sozinha assim que detecta o bot ativo.
+
 ---
 
 ### Comandos úteis
 
 ```bash
-# Inicialização e Configuração
+# === Inicialização e Configuração ===
 make setup         # Configuração inicial (gera .env e segredos)
 make up-build      # Build das imagens e sobe tudo
 make up            # Sobe os containers sem rebuild
 make down          # Para e remove os containers
+make validate      # Valida a sintaxe do docker-compose.yml
 
-# Gerenciamento e Update
-make ravena-ai     # Lint + Build + Restart (ideal para quando editar o código)
-make restart-bot   # Reinicia apenas o container do bot (recarrega bots.json)
+# === Gerenciamento e Update ===
+make restart-bot   # Reinicia o bot (aplicação instantânea com volumes de código ou bots.json)
+make sync          # Sincroniza arquivos locais modificados/não rastreados com o container (sem rebuild)
+make ravena-ai     # Reconstrói a imagem Docker e reinicia o bot (necessário ao mudar package.json ou se não usar volumes)
 make restart-api   # Reinicia apenas o container da API (whatsgoapi)
-make restart       # Reinicia todos os serviços
+make restart       # Reinicia todos os serviços (todos os containers)
+make update-whatsgoapi # Atualiza o submódulo whatsgoapi e reconstrói o container
 
-# Monitoramento e Manutenção
+# === Monitoramento ===
 make logs          # Logs de todos os containers
 make logs-bot      # Logs apenas do bot
-make logs-botapi   # Logs apenas do whatsgoapi
-make ps            # Status dos containers
+make logs-api      # Logs apenas do whatsgoapi
+make ps            # Status de todos os containers
+
+# === Testes e Desenvolvimento ===
+make test          # Roda o harness de testes dentro do container (sem zap)
+make test-quick FILE=path/to/file.js # Sincroniza um arquivo específico e roda o teste
+make test-providers # Valida as chaves de API do service-providers.json
+
+# === Manutenção ===
 make update-allm   # Atualiza comandos na base do AnythingLLM
-
-
 make clean         # Limpa containers parados e imagens órfãs
+make clean-all     # PERIGO: Remove tudo (containers, imagens e VOLUMES)
 ```
 
 ### APIs Opcionais
@@ -329,77 +375,6 @@ docker compose exec ravena-ai node -e "
 - **Saída do processo**: automática — o runner fecha as conexões e encerra ao final
 
 ---
-
-## 🧩 Contribuindo: Implementandos Novos Comandos
-
-Para contribuir com o bot e adicionar um novo comando fixo, crie um arquivo `.js` na pasta `src/functions/`.
-
-Alguns comandos que outros usuários criaram:
-- [Listas](src/functions/ListCommands.js)
-- [Busca de Áudios no MyInstants](src/functions/MyInstantsAudioSearch.js)
-- [Jogo: Anagrama](src/functions/AnagramGame.js)
-
-Aqui vai uma boa base pra começar:
-
-```javascript
-const Logger = require('../utils/Logger');
-const Command = require('../models/Command');
-const ReturnMessage = require('../models/ReturnMessage');
-
-const logger = new Logger('meus-comandos');
-
-const commands = [
-  new Command({
-    name: 'exemplo',
-    description: 'Um comando de exemplo',
-    reactions: {
-      before: "⌛️",  // Emoji mostrado antes da execução
-      after: "✅"    // Emoji mostrado após a execução
-    },
-    method: async (bot, message, args, group) => {
-      const chatId = message.group || message.author;
-      logger.debug(`Executando comando exemplo`);
-      
-      // Obtém o primeiro argumento ou usa um valor padrão
-      const nome = args.length > 0 ? args[0] : "mundo";
-      
-      // Envia a resposta
-      return new ReturnMessage({
-        chatId: chatId,
-        content: `Olá, ${nome}!`
-      });
-    }
-  })
-];
-
-// Exporta os comandos
-module.exports = { commands };
-```
-
-### 🤖 Contribuindo: Criar comandos usando IA
-Se você sabe pedir pras LLMs programarem, aqui vai uma dica de como fazer:
-
-Anexe os seguintes arquivos:
-```
-- models/Group.js
-- models/Command.js
-- models/ReturnMessage.js
-- Este código de exemplo acima como exemplo.js
-```
-Se estiver fazendo alguma função similar a alguma existente no bot, anexo também o arquivo JS da pasta functions - por exemplo, se for fazer um comando que retorne Stickers, anexe o `Stickers.js` para a IA saber como tratar ReturnMessage de stickers, etc.
-
-
-Peça para o LLM:
-```
-Respeitando os padrões de implementação apresentados nos modelos e restante do projeto desenvolva um novo comando conforme instruções a seguir:
-- Comando 'soletrar'
-- Recebe como argumento várias palavras
-- Para cada palavra recebida como argumento, separe as letras com hifen
-
-Exemplo:
-- Entrada: !soletrar batata porco
-- Saída: B-A-T-A-T-A | P-O-R-C-O
-```
 
 ## 📝 Licença
 

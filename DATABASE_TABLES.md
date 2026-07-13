@@ -39,6 +39,7 @@ graph TD
         anagram["anagrama.db → anagram_game, anagram_scores"]
         logic["logic_game.db → logic_users"]
         roleta["roleta.db → roleta_users"]
+        sorteios["sorteios.db → sorteios, sorteio_participants"]
     end
 
     subgraph SOCIAL ["📣 Social & Conteúdo"]
@@ -69,6 +70,7 @@ graph TD
         food_tracker["food_tracker.db → food_logs"]
         horoscopo["horoscopo.db → horoscopo_cache"]
         placas["placas.db → placas_cache"]
+        copa_seguir["copa_seguir.db → copa_seguindo"]
     end
 ```
 
@@ -146,6 +148,35 @@ Números ou LIDs bloqueados localmente que o bot ignora completamente.
 |---|---|---|
 | `number` | TEXT PK | Número de telefone ou LID (sem @c.us/@s.w.net) |
 | `timestamp` | INTEGER | Data do bloqueio (ms) |
+
+### `invite_history`
+Histórico completo de convites de grupo recebidos pelo bot.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremento |
+| `invite_code` | TEXT | Código do convite do WhatsApp |
+| `group_jid` | TEXT | JID do grupo associado (pode ser nulo) |
+| `author_id` | TEXT | JID/número do solicitante do convite |
+| `author_name` | TEXT | Nome/pushname do solicitante |
+| `timestamp` | INTEGER | Data em que o convite foi enviado (ms) |
+| `reason` | TEXT | Motivo fornecido para adicionar o bot |
+| `json_data` | TEXT | Objeto JSON completo do convite |
+
+### `group_membership_periods`
+Histórico de estadias (períodos em que o bot entrou e saiu) de grupos.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremento |
+| `group_jid` | TEXT | JID do grupo associado |
+| `group_name` | TEXT | Nome do grupo associado |
+| `join_timestamp` | INTEGER | Data de entrada no grupo (ms, nulo se desconhecido) |
+| `leave_timestamp` | INTEGER | Data de saída do grupo (ms, nulo se ainda estiver no grupo) |
+| `duration` | INTEGER | Duração da estadia no grupo (ms, nulo se ainda ativo) |
+| `join_responsible` | TEXT | Dados em JSON de quem adicionou o bot (nulo se desconhecido) |
+| `leave_responsible` | TEXT | Dados em JSON de quem removeu o bot (nulo se ativo/desconhecido) |
+| `json_data` | TEXT | Objeto JSON completo do período |
 
 ---
 
@@ -246,7 +277,38 @@ Caça-níqueis. Tabelas: `slots_users` (perfil do jogador), `slots_group_stats` 
 Tarot. Tabela: `tarot_users` — histórico de leituras por usuário.
 
 ### `pinto.db`
-Jogo do Pinto. Tabelas: `pinto_users`, `pinto_group_stats`.
+Jogo do Pinto.
+
+#### `pinto_scores`
+Placar atual dos membros do grupo.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `group_id` | TEXT PK | JID do grupo |
+| `user_id` | TEXT PK | JID do usuário |
+| `user_name` | TEXT | Nome do usuário |
+| `flaccid` | REAL | Comprimento flácido (cm) |
+| `erect` | REAL | Comprimento ereto (cm) |
+| `girth` | REAL | Circunferência (cm) |
+| `curvature` | REAL | Curvatura (-30 a 30 graus) |
+| `score` | INTEGER | Pontuação final |
+| `last_updated` | INTEGER | Timestamp do último teste (ms) |
+
+#### `pinto_history`
+Histórico de todas as jogadas.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremento |
+| `group_id` | TEXT | JID do grupo |
+| `user_id` | TEXT | JID do usuário |
+| `user_name` | TEXT | Nome do usuário |
+| `flaccid` | REAL | Comprimento flácido (cm) |
+| `erect` | REAL | Comprimento ereto (cm) |
+| `girth` | REAL | Circunferência (cm) |
+| `curvature` | REAL | Curvatura (-30 a 30 graus) |
+| `score` | INTEGER | Pontuação final |
+| `timestamp` | INTEGER | Timestamp da jogada (ms) |
 
 ### `anagrama.db`
 Jogo de anagramas. Tabelas: `anagram_game` (partidas ativas), `anagram_scores`.
@@ -256,6 +318,34 @@ Sequência lógica. Tabela: `logic_users` — pontuações.
 
 ### `roleta.db`
 Roleta Russa. Tabela: `roleta_users` — histórico de sobrevivências.
+
+### `sorteios.db`
+Sorteios ativos e passados.
+
+#### `sorteios`
+Informações básicas dos sorteios.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremento |
+| `group_id` | TEXT | JID do grupo (ex: `120363...@g.us`) |
+| `title` | TEXT | Título do sorteio |
+| `message_id` | TEXT | ID da mensagem inicial do sorteio para controle de reações |
+| `status` | TEXT | Status: 'active' ou 'finished' |
+| `created_at` | INTEGER | Timestamp de criação |
+| `winner_id` | TEXT | JID do vencedor |
+| `winner_name` | TEXT | Nome do vencedor |
+| `creator_id` | TEXT | JID de quem criou o sorteio |
+
+#### `sorteio_participants`
+Participantes inscritos em sorteios ativos.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `sorteio_id` | INTEGER | ID do sorteio (FK) |
+| `user_id` | TEXT | JID do participante |
+| `user_name` | TEXT | Nome do participante |
+| `joined_at` | INTEGER | Timestamp de inscrição |
 
 ---
 
@@ -293,6 +383,7 @@ Interações cômicas automáticas do bot.
 | `video_cache.db` | `cached_videos` | Cache de downloads de vídeo |
 | `cmd_usage.db` | `cmd_usage_log` | Log de uso de comandos (analytics) |
 | `cooldowns.db` | `cooldowns` | Rate limiting de comandos por usuário/grupo |
+| `copa_seguir.db` | `copa_seguindo` | Chats que seguem times da Copa 2026 para notificações em tempo real |
 | `llm_stats.db` | `usage_stats` | Tokens consumidos por modelo de IA |
 | `media_stats.db` | `comfy_stats`, `speech_transcription_stats` | Uso de geração de imagem e transcrição |
 | `files.db` | `managed_files` | Arquivos gerenciados pelo FileManager |
@@ -306,3 +397,24 @@ Interações cômicas automáticas do bot.
 | `food_tracker.db` | `food_logs` | Registro alimentar por usuário |
 | `horoscopo.db` | `horoscopo_cache` | Cache de previsões astrológicas |
 | `placas.db` | `placas_cache` | Cache de consultas de placas veiculares |
+| `raffle_cache.db` | `raffle_cache` | Cache de informações e andamento de rifas/ações |
+| `relacionamentos.db` | `relacionamentos` | Histórico e estatísticas de relacionamentos (namoros, casamentos, divórcios, traições e coisas) nos grupos |
+
+### `relacionamentos.db`
+Banco de dados para o módulo de relacionamentos nos grupos do WhatsApp.
+
+#### `relacionamentos`
+Armazena propostas e relacionamentos ativos ou terminados entre os participantes nos grupos.
+
+| Coluna | Tipo | Descrição |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremento |
+| `group_id` | TEXT | JID do grupo (ex: `120363...@g.us`) |
+| `user1` | TEXT | JID do autor / proponente |
+| `user2` | TEXT | JID da pessoa alvo |
+| `tipo` | TEXT | Tipo de relacionamento: 'namoro', 'casamento', ou 'separar' (pedido de separação) |
+| `status` | TEXT | Estado do relacionamento: 'pendente', 'ativo' ou 'terminado' |
+| `criado_em` | INTEGER | Timestamp de criação/ativação do relacionamento |
+| `terminado_em` | INTEGER | Timestamp de término (separação) |
+| `coisas_count` | INTEGER | Contador de quantas vezes o casal coisou |
+| `traicoes_count` | INTEGER | Contador de quantas vezes o autor traiu o cônjuge / parceiros |

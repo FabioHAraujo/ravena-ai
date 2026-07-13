@@ -36,6 +36,8 @@ class StreamSystem {
 		this.dataPath = this.database.databasePath;
 		this.mediaPath = path.join(this.dataPath, "media");
 		this.initialized = false;
+		this.initializing = false;
+		this.initTimeout = null;
 		this.debugNotificacoes = false;
 
 		StreamSystem.instance = this;
@@ -59,10 +61,32 @@ class StreamSystem {
 	/**
 	 * Inicializa o sistema de monitoramento
 	 */
-	async initialize() {
+	async initialize(force = false) {
 		if (this.initialized) return true;
 
+		if (this.initializing && !force) return;
+
+		if (!force) {
+			if (this.initTimeout) return; // already scheduled
+
+			this.initializing = true;
+			this.logger.info(
+				"Agendando inicialização do sistema de monitoramento de streams para 3 minutos após o bot iniciar totalmente..."
+			);
+			this.initTimeout = setTimeout(() => {
+				this.initTimeout = null;
+				this.initialize(true);
+			}, 180000); // 3 minutes
+			return;
+		}
+
+		if (this.initTimeout) {
+			clearTimeout(this.initTimeout);
+			this.initTimeout = null;
+		}
+
 		try {
+			this.initializing = true;
 			// Obtém a instância compartilhada do StreamMonitor
 			// Usa o número de bots registrados ou padrão 50 para max listeners
 			this.streamMonitor = StreamMonitor.getInstance(
@@ -87,9 +111,11 @@ class StreamSystem {
 			});
 
 			this.initialized = true;
+			this.initializing = false;
 			this.logger.info("Sistema de monitoramento de streams inicializado (Singleton)");
 			return true;
 		} catch (error) {
+			this.initializing = false;
 			this.logger.error("Erro ao inicializar sistema de monitoramento de streams:", error);
 			return false;
 		}
@@ -132,16 +158,47 @@ class StreamSystem {
 		// Evento de canal não encontrado
 		this.streamMonitor.on("channelNotFound", async (data) => {
 			try {
-				this.logger.info(`Evento de canal não encontrado: ${data.platform}/${data.channelName}`);
+				this.logger.info(
+					`Evento de canal não encontrado: ${data.platform}/${data.channelName} (status: ${data.channelStatus ?? "unknown"})`
+				);
 
 				// Envia mensagem para o grupo (usando o primeiro bot capaz)
 				if (data.groupId) {
 					const bot = await this.findBotForGroup(data.groupId);
 					if (bot) {
-						await bot.sendMessage(
-							data.groupId,
-							`❌ *Canal não encontrado*\n\nO canal do ${data.platform} com o nome *${data.channelName}* não foi encontrado e foi removido do monitoramento. Verifique se o nome está correto e configure-o novamente se necessário.`
-						);
+						const platformName =
+							data.platform === "youtube"
+								? "YouTube"
+								: data.platform === "twitch"
+									? "Twitch"
+									: "Kick";
+
+						// Monta o link público do canal
+						let channelLink = "";
+						if (data.platform === "twitch") {
+							channelLink = `https://www.twitch.tv/${data.channelName}`;
+						} else if (data.platform === "kick") {
+							channelLink = `https://kick.com/${data.channelName}`;
+						} else if (data.platform === "youtube") {
+							channelLink = `https://www.youtube.com/@${data.channelName}`;
+						}
+
+						// Personaliza a mensagem com base no status detectado
+						let motivoTexto;
+						if (data.channelStatus === "banned") {
+							motivoTexto = `⛔ O canal parece estar *suspenso/banido* pela plataforma por violação dos Termos de Serviço ou Diretrizes da Comunidade.`;
+						} else if (data.channelStatus === "deleted") {
+							motivoTexto = `❌ O canal parece ter sido *deletado ou trocou de nome*.`;
+						} else {
+							motivoTexto = `⚠️ O canal apresentou erros consecutivos de "não encontrado". *Verifique se o nome está correto.*`;
+						}
+
+						const linkTexto = channelLink ? `\n🔗 ${channelLink}` : "";
+
+						const msgAviso = `⚠️ *Canal Temporariamente Pausado*\n\nO canal *${data.channelName}* (${platformName}) foi pausado por 12 horas.${linkTexto}\n\n${motivoTexto}\n\n> O monitoramento será reativado automaticamente após esse período.\n\n\`${data.groupName || data.groupId}\``;
+
+						bot.sendMessage(data.groupId, msgAviso);
+						bot.sendMessage(bot.grupoLogs, msgAviso);
 					}
 				}
 			} catch (error) {
@@ -151,22 +208,41 @@ class StreamSystem {
 	}
 
 	/**
+	 * Encontra o primeiro bot adequado para enviar mensagem em um grupo
+	 * @param {string} groupId
+	 * @returns {Promise<Object|null>}
+	 */
+	async findBotForGroup(groupId) {
+		const bots = await this.findBotsForGroup(groupId);
+		return bots.length > 0 ? bots[0] : null;
+	}
+
+	/**
 	 * Encontra bots adequados para enviar mensagem em um grupo
 	 * @param {string} groupId
 	 * @returns {Promise<Array<Object>>}
 	 */
 	async findBotsForGroup(groupId) {
 		const candidates = [];
+		const gidStr = groupId.toString();
+
+		const isWhatsAppGroup = gidStr.includes("@");
+		const isTelegramGroup = gidStr.startsWith("-");
+		// IDs do Discord são numéricos e longos (geralmente 18+ caracteres)
+		const isDiscordGroup = !isWhatsAppGroup && !isTelegramGroup && gidStr.length >= 17;
+
 		// Itera sobre os bots registrados para encontrar os que podem participar do grupo
 		for (const bot of this.bots) {
 			try {
 				// Verifica compatibilidade de plataforma
-				const isWhatsAppGroup = groupId.toString().includes("@");
 				if (bot.useTelegram) {
-					// Bot Telegram não pode enviar para grupo WhatsApp
-					if (isWhatsAppGroup) continue;
+					// Bot Telegram não pode enviar para grupo WhatsApp ou Discord
+					if (isWhatsAppGroup || isDiscordGroup) continue;
+				} else if (bot.useDiscord) {
+					// Bot Discord não pode enviar para WhatsApp ou Telegram
+					if (isWhatsAppGroup || isTelegramGroup) continue;
 				} else {
-					// Bot WhatsApp não pode enviar para grupo Telegram (que não tem @)
+					// Bot WhatsApp não pode enviar para Telegram ou Discord (que não tem @)
 					if (!isWhatsAppGroup) continue;
 				}
 
@@ -198,59 +274,77 @@ class StreamSystem {
 				youtube: []
 			};
 
+			const now = new Date();
+
 			// Processa cada grupo
 			for (const group of groups) {
-				// Adiciona canais Twitch
-				if (group.twitch && Array.isArray(group.twitch)) {
-					const channelsToRemove = [];
+				let groupModified = false;
+				const platforms = ["twitch", "kick", "youtube"];
 
-					for (const channel of group.twitch) {
-						if (
-							(!channel.channel.startsWith("xxx_") && !channel.channel.includes("twitchtv")) ||
-							!channel.channel.includes("twitch.tv")
-						) {
-							if (cleanup && this.streamMonitor) {
-								const channelExists = await this.streamMonitor.twitchChannelExists(channel.channel);
-								if (!channelExists) {
-									channelsToRemove.push(channel.channel.toLowerCase());
+				for (const platform of platforms) {
+					if (group[platform] && Array.isArray(group[platform])) {
+						const channelsToRemove = [];
+
+						for (const channelConfig of group[platform]) {
+							// Verifica se o canal está pausado
+							if (channelConfig.pausedUntil) {
+								if (new Date(channelConfig.pausedUntil) > now) {
+									// Pausado, pula o monitoramento
 									continue;
+								} else {
+									// Pausa expirada, reativa
+									this.logger.info(
+										`Reativando canal ${platform}/${channelConfig.channel} no grupo ${group.id} (pausa expirada no carregamento)`
+									);
+									delete channelConfig.pausedUntil;
+									delete channelConfig.pausedReason;
+									groupModified = true;
 								}
-								await sleep(500);
 							}
 
-							if (!subscribedChannels.twitch.includes(channel.channel)) {
-								this.streamMonitor.subscribe(channel.channel, "twitch");
-								subscribedChannels.twitch.push(channel.channel);
+							// Caso específico de limpeza da Twitch
+							if (platform === "twitch") {
+								if (
+									(!channelConfig.channel.startsWith("xxx_") &&
+										!channelConfig.channel.includes("twitchtv")) ||
+									!channelConfig.channel.includes("twitch.tv")
+								) {
+									if (cleanup && this.streamMonitor) {
+										const channelExists = await this.streamMonitor.twitchChannelExists(
+											channelConfig.channel
+										);
+										if (!channelExists) {
+											channelsToRemove.push(channelConfig.channel.toLowerCase());
+											continue;
+										}
+										await sleep(500);
+									}
+
+									if (!subscribedChannels.twitch.includes(channelConfig.channel)) {
+										this.streamMonitor.subscribe(channelConfig.channel, "twitch");
+										subscribedChannels.twitch.push(channelConfig.channel);
+									}
+								}
+							} else {
+								// Kick e YouTube
+								if (!subscribedChannels[platform].includes(channelConfig.channel)) {
+									this.streamMonitor.subscribe(channelConfig.channel, platform);
+									subscribedChannels[platform].push(channelConfig.channel);
+								}
 							}
 						}
-					}
 
-					if (cleanup && channelsToRemove.length > 0) {
-						group.twitch = group.twitch.filter(
-							(c) => !channelsToRemove.includes(c.channel.toLowerCase())
-						);
-						await this.database.saveGroup(group);
+						if (cleanup && platform === "twitch" && channelsToRemove.length > 0) {
+							group.twitch = group.twitch.filter(
+								(c) => !channelsToRemove.includes(c.channel.toLowerCase())
+							);
+							groupModified = true;
+						}
 					}
 				}
 
-				// Adiciona canais Kick
-				if (group.kick && Array.isArray(group.kick)) {
-					for (const channel of group.kick) {
-						if (!subscribedChannels.kick.includes(channel.channel)) {
-							this.streamMonitor.subscribe(channel.channel, "kick");
-							subscribedChannels.kick.push(channel.channel);
-						}
-					}
-				}
-
-				// Adiciona canais YouTube
-				if (group.youtube && Array.isArray(group.youtube)) {
-					for (const channel of group.youtube) {
-						if (!subscribedChannels.youtube.includes(channel.channel)) {
-							this.streamMonitor.subscribe(channel.channel, "youtube");
-							subscribedChannels.youtube.push(channel.channel);
-						}
-					}
+				if (groupModified) {
+					await this.database.saveGroup(group);
 				}
 			}
 
@@ -358,6 +452,7 @@ class StreamSystem {
 
 			// Tenta enviar com cada bot candidato até conseguir
 			let sentSuccess = false;
+			let titleChanged = false;
 			const notInGroupErrors = [];
 
 			for (const bot of bots) {
@@ -365,11 +460,15 @@ class StreamSystem {
 					const returnMessages = [];
 
 					// Processa alteração de título (se habilitada)
-					this.logger.debug(
-						`[processStreamEvent] ${group.name} -> changeTitleOnEvent '${channelConfig.changeTitleOnEvent}'`
-					);
-					if (channelConfig.changeTitleOnEvent) {
-						await this.changeGroupTitleForStream(bot, group, channelConfig, eventData, eventType);
+					if (channelConfig.changeTitleOnEvent && !titleChanged) {
+						this.logger.debug(`[processStreamEvent] ${group.name} -> changeTitleOnEvent 'true'`);
+						titleChanged = await this.changeGroupTitleForStream(
+							bot,
+							group,
+							channelConfig,
+							eventData,
+							eventType
+						);
 					}
 
 					// Obter menções
@@ -408,12 +507,9 @@ class StreamSystem {
 						const resultados = await bot.sendReturnMessages(returnMessages);
 
 						// Verifica se houve erro de envio específico de "não está no grupo"
-						// Assumindo que sendReturnMessages retorna array de resultados ou objetos de erro
 						let botNotInGroupError = false;
 
 						for (const res of resultados) {
-							// Adaptação para verificar erro na resposta do bot
-							// Exemplo: { status: 500, message: '...', data: { error: "failed to get group members: you're not participating in that group" } }
 							if (res && res.error) {
 								const err = res.error;
 								// Coleta todas as possíveis strings de erro (mensagem, data.error, response.data.error)
@@ -448,7 +544,7 @@ class StreamSystem {
 							continue; // Tenta próximo bot
 						}
 
-						// Sucesso!
+						// Sucesso no envio das mensagens!
 						sentSuccess = true;
 						this.logger.info(
 							`Notificação de ${eventData.platform}/${eventData.channelName} enviada para ${group.name} (${group.id}) via ${bot.id}`
@@ -462,9 +558,13 @@ class StreamSystem {
 						}
 						break; // Sai do loop de bots
 					} else {
-						// Nenhuma mensagem gerada, considera "sucesso" para não tentar outros bots inutilmente
-						sentSuccess = true;
-						break;
+						// Nenhuma mensagem gerada.
+						// Se era pra mudar o título e conseguimos (ou não era pra mudar), consideramos sucesso.
+						if (!channelConfig.changeTitleOnEvent || titleChanged) {
+							sentSuccess = true;
+							break;
+						}
+						// Se falhou em mudar o título e não tinha mensagens, continua tentando com o próximo bot
 					}
 				} catch (err) {
 					this.logger.error(`Erro ao tentar enviar com bot ${bot.id} para grupo ${group.id}:`, err);
@@ -583,7 +683,19 @@ class StreamSystem {
 	async changeGroupTitleForStream(bot, group, channelConfig, eventData, eventType) {
 		try {
 			const chat = await bot.client.getChatById(group.id);
-			if (!chat || !chat.isGroup) return;
+			if (!chat || !chat.isGroup) {
+				//this.logger.debug(`Bot ${bot.id} não conseguiu obter chat para ${group.id}`);
+				return false;
+			}
+
+			if (chat.notInGroup) {
+				this.logger.debug(
+					`Bot ${bot.id} não está no grupo ${group.id}, ignorando mudança de título.`
+				);
+				return false;
+			}
+
+			let success = true;
 
 			if (channelConfig.changeTitleOnEvent) {
 				let newTitle;
@@ -617,10 +729,18 @@ class StreamSystem {
 				}
 
 				try {
-					this.logger.debug(`[changeGroupTitleForStream] Result ${group.name} -> '${newTitle}'`);
-					await chat.setSubject(newTitle);
+					if (chat.name === newTitle) {
+						this.logger.debug(`[changeGroupTitleForStream] Título já está correto: ${newTitle}`);
+					} else if (typeof chat.setSubject === "function") {
+						this.logger.debug(`[changeGroupTitleForStream] Result ${group.name} -> '${newTitle}'`);
+						await chat.setSubject(newTitle);
+					} else {
+						this.logger.warn(`Bot ${bot.id} não possui método setSubject para o grupo ${group.id}`);
+						success = false;
+					}
 				} catch (titleError) {
 					this.logger.error(`Erro ao alterar título do grupo ${group.id}:`, titleError);
+					success = false;
 				}
 			}
 
@@ -630,8 +750,14 @@ class StreamSystem {
 			} else if (eventType === "offline" && channelConfig.groupPhotoOffline) {
 				await this.changeGroupPhoto(bot, chat, channelConfig.groupPhotoOffline);
 			}
+
+			return success;
 		} catch (error) {
-			this.logger.error(`Erro ao alterar título/foto do grupo ${group.id}:`, error);
+			this.logger.error(
+				`Erro ao alterar título/foto do grupo ${group.id} via bot ${bot.id}:`,
+				error
+			);
+			return false;
 		}
 	}
 

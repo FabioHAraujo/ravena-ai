@@ -30,6 +30,24 @@ class DatabaseBackup {
 		this.recoveringDbs = new Set();
 	}
 
+	shouldIgnoreFile(filename) {
+		if (this.backupIgnoreFiles.includes(filename)) return true;
+		if (filename === "cache.db" || filename.startsWith("cache.db-")) return true;
+		if (filename.includes("corrupt") || filename.includes("corrupted")) return true;
+
+		// Ignore databases flagged as noBackup (and their companion files like -wal, -shm)
+		if (this.db && this.db.noBackupDatabases) {
+			for (const noBackupDb of this.db.noBackupDatabases) {
+				const prefix = `${noBackupDb}.db`;
+				if (filename === prefix || filename.startsWith(`${prefix}-`)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
 	async createScheduledBackup() {
 		try {
 			const now = new Date();
@@ -40,11 +58,52 @@ class DatabaseBackup {
 				fs.mkdirSync(backupDir, { recursive: true });
 			}
 
-			// 1. File-based Backup
+			const backedUpFiles = new Set();
+
+			// 1. Safe SQLite Backups for active better-sqlite3 connections
+			if (this.db.mappers && this.db.mappers.connections) {
+				const destSqlitesDir = path.join(backupDir, "sqlites");
+				if (!fs.existsSync(destSqlitesDir)) {
+					fs.mkdirSync(destSqlitesDir, { recursive: true });
+				}
+
+				for (const [name, conn] of Object.entries(this.db.mappers.connections)) {
+					if (
+						name === "cooldowns" ||
+						name === "cache" ||
+						name.includes("corrupt") ||
+						name.includes("corrupted") ||
+						(this.db.noBackupDatabases && this.db.noBackupDatabases.has(name))
+					) {
+						continue;
+					}
+					try {
+						const dbFile = name === "core" ? "core.db" : `${name}.db`;
+						const destPath = path.join(destSqlitesDir, dbFile);
+
+						// Perform a safe SQLite online backup of the live database connection
+						await conn.backup(destPath);
+						backedUpFiles.add(dbFile);
+						this.logger.info(`Safe online backup created for connection '${name}' to ${destPath}`);
+					} catch (backupErr) {
+						this.logger.error(`Failed to create safe online backup for '${name}':`, backupErr);
+					}
+				}
+			}
+
+			// 2. Fallback: Copy any other database files not currently open
 			for (const target of this.backupTargets) {
 				if (fs.existsSync(target)) {
 					const dest = path.join(backupDir, path.basename(target));
-					this.backupDirectory(target, dest);
+					if (!fs.existsSync(dest)) {
+						fs.mkdirSync(dest, { recursive: true });
+					}
+
+					const items = fs.readdirSync(target);
+					for (const item of items) {
+						if (backedUpFiles.has(item)) continue; // Already backed up safely
+						this.backupDirectory(path.join(target, item), path.join(dest, item));
+					}
 				}
 			}
 
@@ -87,7 +146,7 @@ class DatabaseBackup {
 	backupDirectory(source, target) {
 		try {
 			const baseName = path.basename(source);
-			if (this.backupIgnoreFiles.includes(baseName)) return;
+			if (this.shouldIgnoreFile(baseName)) return;
 
 			const stats = fs.statSync(source);
 			if (stats.isDirectory()) {
@@ -200,7 +259,7 @@ class DatabaseBackup {
 		const sqlitesDir = path.join(this.databasePath, "sqlites");
 		const sqliteFiles = fs
 			.readdirSync(sqlitesDir)
-			.filter((f) => f.endsWith(".db") && !this.backupIgnoreFiles.includes(f) && f !== "core.db");
+			.filter((f) => f.endsWith(".db") && f !== "core.db" && !this.shouldIgnoreFile(f));
 
 		this.logger.info(`Found ${sqliteFiles.length} additional SQLite databases to sync.`);
 
@@ -411,6 +470,11 @@ Error: \`${error.message}\``);
 				await new Promise((resolve) => {
 					db.close((err) => resolve());
 				});
+			}
+
+			// Ensure underlying better-sqlite3 connection is closed in DatabaseMappers
+			if (this.db.mappers) {
+				this.db.mappers.closeConnection(dbName);
 			}
 
 			const dbFile = dbName === "core" ? "core.db" : `${dbName}.db`;
@@ -633,22 +697,34 @@ ${err.message}`);
 	}
 
 	async reinitConnection(dbName) {
-		const dbFile = dbName === "core" ? "core.db" : `${dbName}.db`;
-		const dbPath = path.join(this.databasePath, "sqlites", dbFile);
-
+		// Close the mock wrapper if it exists (no-op but good practice)
 		if (dbName === "core") {
-			if (this.db.coreDb) this.db.coreDb.close();
-			this.db.coreDb = new sqlite3.Database(dbPath);
-			this.db.coreDb.run("PRAGMA journal_mode = WAL");
-			this.db.coreDb.run("PRAGMA synchronous = NORMAL");
-			this.db.coreDb.run("PRAGMA busy_timeout = 5000");
+			if (this.db.coreDb) {
+				try {
+					this.db.coreDb.close();
+				} catch (e) {}
+			}
 		} else {
-			if (this.db.sqlites[dbName]) this.db.sqlites[dbName].close();
-			this.db.sqlites[dbName] = new sqlite3.Database(dbPath);
-			this.db.sqlites[dbName].run("PRAGMA journal_mode = WAL");
-			this.db.sqlites[dbName].run("PRAGMA synchronous = NORMAL");
-			this.db.sqlites[dbName].run("PRAGMA busy_timeout = 5000");
+			if (this.db.sqlites[dbName]) {
+				try {
+					this.db.sqlites[dbName].close();
+				} catch (e) {}
+			}
 		}
+
+		// Reopen the in-memory connection in mappers, which automatically loads the restored file from disk
+		if (this.db.mappers) {
+			this.db.mappers.reopenConnection(dbName);
+		}
+
+		// Recreate the mock wrappers using the Database class's attached Sqlite3MockWrapper definition
+		const Sqlite3MockWrapper = this.db.constructor.Sqlite3MockWrapper;
+		if (dbName === "core") {
+			this.db.coreDb = new Sqlite3MockWrapper("core", this.db.mappers);
+		} else {
+			this.db.sqlites[dbName] = new Sqlite3MockWrapper(dbName, this.db.mappers);
+		}
+
 		this.logger.info(`Reinitialized connection for ${dbName}`);
 	}
 }

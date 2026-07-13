@@ -470,14 +470,14 @@ async function squareStickerCommand(bot, message, args, group, cropType) {
 			// Mídia na mensagem atual
 			logger.debug(`Processando mídia da mensagem atual: ${message.type}`);
 
-			// Verifica se content já está no formato correto
-			if (message.content && typeof message.content === "object") {
-				// Se content já for um objeto, use-o diretamente
+			// Lazy loading: só usa content direto se já tiver .data (base64)
+			if (message.content && message.content.data) {
 				mediaBuffer = message.content;
 				mimeType = message.content.mimetype;
-			} else if (message.downloadMedia) {
-				// Se tiver o método downloadMedia, use-o
+			} else if (typeof message.downloadMedia === "function") {
+				// Baixa sob demanda
 				const media = await message.downloadMedia();
+				if (!media) throw new Error("Falha ao baixar mídia");
 				mediaBuffer = media;
 				mimeType = media.mimetype;
 			} else {
@@ -488,6 +488,23 @@ async function squareStickerCommand(bot, message, args, group, cropType) {
 		} else {
 			// Mídia na mensagem citada
 			const quotedMsg = await message.origin.getQuotedMessage();
+
+			// Se não há mensagem citada nem mídia direta
+			if (!quotedMsg) {
+				await message.origin.react("❌");
+				if (message.hasQuotedMsg) {
+					// Havia uma mensagem citada, mas saiu do cache
+					return new ReturnMessage({
+						chatId,
+						content:
+							"⚠️ Não foi possível recuperar a mídia da mensagem marcada. Ela pode ter saído do cache ou o download falhou."
+					});
+				}
+				return new ReturnMessage({
+					chatId,
+					content: "Envie uma imagem/vídeo com a legenda do comando, ou responda a uma mídia."
+				});
+			}
 
 			// Verificar se o tipo de mídia é suportado
 			const mediaType = quotedMsg.type.toLowerCase();
@@ -737,10 +754,25 @@ async function processAutoSticker(bot, message, group) {
 		// Criar um nome para o sticker (pode ser o nome de quem enviou ou um padrão)
 		const stickerName = message.authorName || "sticker";
 
+		// Lazy loading: garante que o base64 esteja disponível antes de enviar
+		let stickerContent = message.content;
+		if (!stickerContent?.data && typeof message.downloadMedia === "function") {
+			try {
+				stickerContent = await message.downloadMedia();
+			} catch (e) {
+				logger.error("[processAutoSticker] Erro ao baixar mídia:", e);
+				return false;
+			}
+		}
+		if (!stickerContent?.data) {
+			logger.warn("[processAutoSticker] Mídia sem dados, abortando");
+			return false;
+		}
+
 		// Usar ReturnMessage para enviar o sticker
 		const returnMessage = new ReturnMessage({
 			chatId: message.author,
-			content: message.content,
+			content: stickerContent,
 			options: {
 				sendMediaAsSticker: true,
 				stickerAuthor: "ravena",

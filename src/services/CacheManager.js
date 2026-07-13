@@ -13,6 +13,10 @@ const CACHE_CONFIG = {
 
 class CacheManager {
 	constructor(redisURL, redisDB, redisTTL, maxCacheSize) {
+		if (CacheManager.instance) {
+			return CacheManager.instance;
+		}
+
 		this.useRedis = process.env.USE_REDIS === "true";
 		this.logger = new Logger(`cache-manager`);
 		this.redisURL = redisURL;
@@ -32,8 +36,8 @@ class CacheManager {
 		this.pendingWrites = new Map();
 
 		this.unsavedChangesCount = 0;
-		this.FLUSH_THRESHOLD = 100;
-		this.FLUSH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+		this.FLUSH_THRESHOLD = 500; // Increased threshold for centralized manager
+		this.FLUSH_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes flush interval
 
 		// Database setup
 		this.database = Database.getInstance();
@@ -46,6 +50,7 @@ class CacheManager {
 		this.database.getSQLiteDb(
 			this.DB_NAME,
 			`
+      PRAGMA auto_vacuum = INCREMENTAL;
       CREATE TABLE IF NOT EXISTS kv_store (
         key TEXT PRIMARY KEY,
         value TEXT,
@@ -130,6 +135,18 @@ class CacheManager {
 
 		// Setup shutdown hook
 		this.setupShutdown();
+
+		CacheManager.instance = this;
+	}
+
+	/**
+	 * Get Singleton Instance
+	 */
+	static getInstance(redisURL, redisDB, redisTTL, maxCacheSize) {
+		if (!CacheManager.instance) {
+			CacheManager.instance = new CacheManager(redisURL, redisDB, redisTTL, maxCacheSize);
+		}
+		return CacheManager.instance;
 	}
 
 	setupShutdown() {
@@ -283,6 +300,9 @@ class CacheManager {
 			for (const table of tables) {
 				await this.database.dbRun(this.DB_NAME, `DELETE FROM ${table} WHERE expires_at < ?`, [now]);
 			}
+
+			// Reclaim empty space from deleted records incrementally (1000 pages = ~4MB per hour)
+			await this.database.dbRun(this.DB_NAME, "PRAGMA incremental_vacuum(1000)");
 		} catch (e) {
 			this.logger.error("Error cleaning expired cache:", e);
 		}

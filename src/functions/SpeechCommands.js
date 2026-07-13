@@ -6,7 +6,6 @@ const { v4: uuidv4 } = require("uuid");
 const os = require("os");
 const axios = require("axios");
 const FormData = require("form-data");
-const { URLSearchParams } = require("url");
 const Logger = require("../utils/Logger");
 const Database = require("../utils/Database");
 const crypto = require("crypto");
@@ -113,27 +112,45 @@ async function getAudioDuration(filePath) {
 }
 
 /**
- * Obtém mídia da mensagem
+ * Obtém mídia da mensagem.
+ * Retorna { media, hadQuoted, quotedHadMedia } para distinguir erros.
  * @param {Object} message - O objeto da mensagem
- * @returns {Promise<MessageMedia|null>} - O objeto de mídia ou null
+ * @returns {Promise<{media: MessageMedia|null, hadQuoted: boolean, quotedHadMedia: boolean|null}>}
  */
 async function getMediaFromMessage(message) {
 	// Se a mensagem tem mídia direta
 	if (message.type !== "text") {
-		return message.content;
+		// Lazy loading: só usa content direto se já tiver .data (base64)
+		if (message.content && message.content.data) {
+			return { media: message.content, hadQuoted: false, quotedHadMedia: false };
+		}
+		if (typeof message.downloadMedia === "function") {
+			try {
+				const media = await message.downloadMedia();
+				return { media, hadQuoted: false, quotedHadMedia: false };
+			} catch (e) {
+				logger.error("[getMediaFromMessage] Erro ao baixar mídia:", e);
+				return { media: null, hadQuoted: false, quotedHadMedia: false };
+			}
+		}
+		return { media: message.content ?? null, hadQuoted: false, quotedHadMedia: false };
 	}
+
+	const hadQuoted = !!message.hasQuotedMsg;
 
 	// Tenta obter mídia da mensagem citada
 	try {
 		const quotedMsg = await message.origin.getQuotedMessage();
 		if (quotedMsg && quotedMsg.hasMedia) {
-			return await quotedMsg.downloadMedia();
+			const media = await quotedMsg.downloadMedia();
+			return { media, hadQuoted, quotedHadMedia: true };
 		}
+		return { media: null, hadQuoted, quotedHadMedia: quotedMsg ? false : null };
 	} catch (error) {
 		logger.error("Erro ao obter mídia da mensagem citada:", error);
 	}
 
-	return null;
+	return { media: null, hadQuoted, quotedHadMedia: null };
 }
 
 /**
@@ -191,7 +208,7 @@ function removeWhatsAppMarkup(text) {
 }
 
 /**
- * Converte texto para voz usando AllTalk API (XTTS)
+ * Converte texto para voz usando F5-TTS API (OpenAI-compatible)
  * @param {WhatsAppBot} bot - Instância do bot
  * @param {Object} message - Dados da mensagem
  * @param {Array} args - Argumentos do comando
@@ -236,7 +253,7 @@ async function textToSpeech(bot, message, args, group, char = "ravena") {
 			});
 		}
 
-		// Limpa as marcações do WhatsApp antes de processar com AllTalk
+		// Limpa as marcações do WhatsApp antes de processar com F5-TTS
 		text = removeWhatsAppMarkup(text);
 
 		const character = ttsCharacters.find((ttsC) => ttsC.name === char);
@@ -256,52 +273,33 @@ async function textToSpeech(bot, message, args, group, char = "ravena") {
 
 		logger.debug(`Convertendo texto para voz (${JSON.stringify(character)}): ${text}`);
 		const EventHandler = require("../EventHandler");
-		EventHandler.getInstance().emit("activity", { type: "alltalk" });
+		EventHandler.getInstance().emit("activity", { type: "f5tts" });
 
 		// Nome do arquivo temporário
 		const hash = crypto.randomBytes(2).toString("hex");
 		const tempFilename = `tts_audio_${hash}.mp3`;
 		const tempFilePath = path.join(tempDir, tempFilename);
 
-		// Monta a URL para a API do AllTalk
-		const allTalkProviders = serviceProviderService.getProviders("alltalk");
-		const allTalkUrl = allTalkProviders[0]?.url || "http://localhost:7851/";
-		const apiUrl = `${allTalkUrl}/api/tts-generate`;
+		// Monta a URL para a API do F5-TTS
+		const f5ttsProviders = serviceProviderService.getProviders("f5tts");
+		const f5ttsUrl = f5ttsProviders[0]?.url || "http://localhost:5050";
+		const f5ttsApiKey = f5ttsProviders[0]?.apiKey || "";
+		const apiUrl = `${f5ttsUrl}/v1/audio/speech`;
 
-		// Cria os parâmetros para a requisição usando URLSearchParams
-		const params = new URLSearchParams({
-			text_input: text,
-			text_filtering: "standard",
-			character_voice_gen: character.voice,
-			narrator_enabled: "false",
-			language: "pt",
-			output_file_name: `tts_audio_${hash}`,
-			output_file_timestamp: "false"
-		});
-
-		// Faz a requisição para a API
-		const response = await axios({
+		// Faz a requisição para a API F5-TTS (OpenAI-compatible)
+		const audioResponse = await axios({
 			method: "post",
 			url: apiUrl,
-			data: params,
+			data: {
+				model: "f5-tts",
+				input: text,
+				voice: character.name,
+				response_format: "mp3"
+			},
 			headers: {
-				"Content-Type": "application/x-www-form-urlencoded"
-			}
-		});
-
-		if (response.data.status !== "generate-success") {
-			throw new Error(`Falha na geração de voz: ${response.data.status}`);
-		}
-
-		console.log(response.data);
-
-		// Obter o arquivo de áudio da API
-		const urlResultado = `${allTalkUrl}${response.data.output_file_url}`;
-		logger.info(`Baixando mídia de '${urlResultado}'`);
-
-		const audioResponse = await axios({
-			method: "get",
-			url: urlResultado,
+				"Content-Type": "application/json",
+				...(f5ttsApiKey ? { Authorization: `Bearer ${f5ttsApiKey}` } : {})
+			},
 			responseType: "arraybuffer"
 		});
 
@@ -383,9 +381,10 @@ async function textToSpeech(bot, message, args, group, char = "ravena") {
  * Helper to transcribe audio via Whisper API with failover
  * @param {string} audioPath - Path to audio file
  * @param {function} onEstimation - Callback for estimation (duration, estimatedTime)
+ * @param {function} onStatus - Callback for status updates (status, executionId, url)
  * @returns {Promise<{text: string, duration: number}>}
  */
-async function transcribeViaAPI(audioPath, onEstimation) {
+async function transcribeViaAPI(audioPath, onEstimation, onStatus) {
 	const whisperProviders = serviceProviderService.getProviders("whisper");
 	const urls = whisperProviders.map((p) => p.url);
 
@@ -422,6 +421,10 @@ async function transcribeViaAPI(audioPath, onEstimation) {
 				onEstimation(apiDuration, estimatedTranscriptionTime);
 			}
 
+			if (onStatus) {
+				onStatus("queued", executionId, url);
+			}
+
 			let finalResult = null;
 			let firstCheck = true;
 			// Loop waiting for completion
@@ -435,13 +438,15 @@ async function transcribeViaAPI(audioPath, onEstimation) {
 				});
 				const result = statusResponse.data;
 
-				// logger.debug(`[${new Date().toLocaleTimeString()}] Status atual: ${result.status}`);
+				if (onStatus) {
+					onStatus(result.status, executionId, url);
+				}
 
 				if (result.status === "complete") {
 					finalResult = result;
 					return { text: result.text, duration: apiDuration };
 				} else if (result.status === "error") {
-					throw new Error(`API Error: ${result.error}`);
+					throw new Error(`API Error: ${result.error || result.message || "Erro desconhecido"}`);
 				}
 				// If processing or queued, continue loop
 			}
@@ -494,8 +499,19 @@ async function speechToText(bot, message, args, group, optimizeWithLLM = true) {
 
 	try {
 		// Obtém mídia da mensagem
-		const media = await getMediaFromMessage(message);
+		const { media, hadQuoted, quotedHadMedia } = await getMediaFromMessage(message);
 		if (!media) {
+			if (hadQuoted && quotedHadMedia !== false) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"⚠️ Não foi possível recuperar o áudio da mensagem marcada. Ela pode ter saído do cache ou o download falhou.",
+					options: {
+						quotedMessageId: message.origin.id._serialized,
+						goReply: message.origin
+					}
+				});
+			}
 			return new ReturnMessage({
 				chatId,
 				content: "Por favor, forneça um áudio ou mensagem de voz.",
@@ -564,7 +580,18 @@ async function speechToText(bot, message, args, group, optimizeWithLLM = true) {
 				logger.info("\n✅ Transcrição Concluída!\n");
 			} catch (apiError) {
 				logger.error("[speechToText] Erro ao usar Whisper API:", apiError);
-				transcribedText = "Erro ao transcrever áudio via API. Por favor, tente novamente.";
+				const isNetworkError =
+					apiError.code === "ETIMEDOUT" ||
+					apiError.code === "EHOSTUNREACH" ||
+					apiError.code === "ECONNREFUSED" ||
+					apiError.code === "ENOTFOUND" ||
+					apiError.message?.toLowerCase().includes("timeout") ||
+					apiError.message?.toLowerCase().includes("unreach") ||
+					apiError.message?.toLowerCase().includes("connect");
+
+				transcribedText = isNetworkError
+					? "Erro no servidor de transcrição"
+					: `Erro ao transcrever áudio via API: ${apiError.message || apiError}`;
 			}
 		} else {
 			// Whisper API not configured in service-providers.json
@@ -577,9 +604,11 @@ async function speechToText(bot, message, args, group, optimizeWithLLM = true) {
 
 		logger.debug(`[speechToText] LIDO arquivo de saida: '${transcribedText}'`);
 
-		if (!transcribedText || transcribedText.includes("Erro ao transcrever áudio")) {
-			transcribedText =
-				"Não foi possível transcrever o áudio. O áudio pode estar muito baixo ou pouco claro.";
+		if (!transcribedText || transcribedText.startsWith("Erro")) {
+			if (transcribedText !== "Erro no servidor de transcrição") {
+				transcribedText =
+					"Não foi possível transcrever o áudio. O áudio pode estar muito baixo ou pouco claro.";
+			}
 
 			const errorMessage = new ReturnMessage({
 				chatId,
@@ -692,11 +721,13 @@ async function processAutoSTT(bot, message, group, opts) {
 			return false;
 		}
 
+		/* O bot não deve reagir a interações automáticas
 		try {
 			await message.origin.react(process.env.LOADING_EMOJI ?? "⌛️");
 		} catch (e) {
 			logger.error(`[processAutoSTT] Erro enviando notificação inicial`);
 		}
+		*/
 
 		logger.debug(`[processAutoSTT] Processamento Auto-STT para mensagem no chat ${chatId}`);
 
@@ -728,7 +759,18 @@ async function processAutoSTT(bot, message, group, opts) {
 				logger.info("✅ Transcrição Concluída!");
 			} catch (apiError) {
 				logger.error("[processAutoSTT] Erro ao usar Whisper API:", apiError);
-				transcribedText = "Erro ao transcrever áudio via API.";
+				const isNetworkError =
+					apiError.code === "ETIMEDOUT" ||
+					apiError.code === "EHOSTUNREACH" ||
+					apiError.code === "ECONNREFUSED" ||
+					apiError.code === "ENOTFOUND" ||
+					apiError.message?.toLowerCase().includes("timeout") ||
+					apiError.message?.toLowerCase().includes("unreach") ||
+					apiError.message?.toLowerCase().includes("connect");
+
+				transcribedText = isNetworkError
+					? "Erro no servidor de transcrição"
+					: `Erro ao transcrever áudio via API: ${apiError.message || apiError}`;
 			}
 		} else {
 			// Whisper API not configured in service-providers.json
@@ -740,7 +782,7 @@ async function processAutoSTT(bot, message, group, opts) {
 
 		// Se a transcrição for bem-sucedida, envia-a
 		let contentRetorno = "";
-		if (transcribedText && !transcribedText.includes("Erro ao transcrever áudio")) {
+		if (transcribedText && !transcribedText.startsWith("Erro")) {
 			// Cria ReturnMessage com a transcrição
 			contentRetorno = cleanupString(transcribedText?.trim() ?? "");
 
@@ -786,6 +828,26 @@ async function processAutoSTT(bot, message, group, opts) {
 			});
 		} else {
 			logger.warn(`[processAutoSTT] Transcrição vazia ou com erro para o chat ${chatId}`);
+			// Se for no PV (sem grupo), envia a mensagem de erro correspondente ao !stt
+			if (!group) {
+				let errorText = transcribedText;
+				if (
+					!errorText ||
+					(errorText.startsWith("Erro") && errorText !== "Erro no servidor de transcrição")
+				) {
+					errorText =
+						"Não foi possível transcrever o áudio. O áudio pode estar muito baixo ou pouco claro.";
+				}
+				const errorMessage = new ReturnMessage({
+					chatId,
+					content: errorText,
+					options: {
+						quotedMessageId: message.origin.id._serialized,
+						goReply: message.origin
+					}
+				});
+				await bot.sendReturnMessages(errorMessage, group);
+			}
 		}
 
 		if (opts.returnResult) {
@@ -993,3 +1055,4 @@ const commands = [
 // Exporta função para ser usada em EventHandler
 module.exports.commands = commands;
 module.exports.processAutoSTT = processAutoSTT;
+module.exports.transcribeViaAPI = transcribeViaAPI;

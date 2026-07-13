@@ -431,7 +431,7 @@ class LLMService {
 	 * @param {string} [options.customEndpoint] - Endpoint customizado (para APIs compatíveis)
 	 * @returns {Promise<Object>} - A resposta da API
 	 */
-	async openAICompletion(options) {
+	async openaiCompletion(options) {
 		try {
 			// Determina endpoint
 			let endpoint = "https://api.openai.com/v1/chat/completions";
@@ -463,25 +463,59 @@ class LLMService {
 				options.systemContext ??
 				"Você é ravena, um bot de whatsapp criado por moothz. Não se apresente, a menos que solicitado pelo usuário.";
 
-			const response = await axios.post(
-				endpoint,
-				{
-					model,
-					messages: [
-						{ role: "system", content: ctxInclude },
-						{ role: "user", content: options.prompt }
-					],
-					max_tokens: options.maxTokens ?? 5000,
-					temperature: options.temperature ?? 0.7
-				},
-				{
-					headers: {
-						Authorization: apiKey,
-						"Content-Type": "application/json"
-					},
-					timeout: options.timeout ?? this.apiTimeout
+			// Monta o conteúdo do user message (texto simples ou array com imagens para vision)
+			let userContent;
+			const hasImages = !!(options.image || (options.images && options.images.length > 0));
+			if (hasImages) {
+				const imagesToProcess = options.images ? options.images : [options.image];
+				userContent = [{ type: "text", text: options.prompt }];
+				for (const img of imagesToProcess) {
+					let base64;
+					if (img.startsWith("data:image")) {
+						// Já é data URL completo
+						userContent.push({
+							type: "image_url",
+							image_url: { url: img }
+						});
+					} else {
+						// Raw base64 — detectar mime type pelo header ou assumir jpeg
+						base64 = img;
+						let mime = "image/jpeg";
+						if (base64.startsWith("/9j/")) mime = "image/jpeg";
+						else if (base64.startsWith("iVBOR")) mime = "image/png";
+						else if (base64.startsWith("R0lGO")) mime = "image/gif";
+						else if (base64.startsWith("UklGR")) mime = "image/webp";
+						userContent.push({
+							type: "image_url",
+							image_url: { url: `data:${mime};base64,${base64}` }
+						});
+					}
 				}
-			);
+			} else {
+				userContent = options.prompt;
+			}
+
+			const payload = {
+				model,
+				messages: [
+					{ role: "system", content: ctxInclude },
+					{ role: "user", content: userContent }
+				],
+				max_tokens: options.maxTokens ?? 5000,
+				temperature: options.temperature ?? 0.7
+			};
+
+			if (options.response_format) {
+				payload.response_format = options.response_format;
+			}
+
+			const response = await axios.post(endpoint, payload, {
+				headers: {
+					Authorization: apiKey,
+					"Content-Type": "application/json"
+				},
+				timeout: options.timeout ?? this.apiTimeout
+			});
 
 			this._trackUsage("OpenAI", response.data, model, options);
 
@@ -528,27 +562,57 @@ class LLMService {
 				options.systemContext ??
 				"Você é ravena, um bot de whatsapp criado por moothz. Não se apresente, a menos que solicitado pelo usuário.";
 
-			const response = await axios.post(
-				endpoint,
-				{
-					model,
-					messages: [
-						{ role: "system", content: ctxInclude },
-						{ role: "user", content: options.prompt }
-					],
-					max_tokens: options.maxTokens ?? 5000,
-					temperature: options.temperature ?? 0.7
-				},
-				{
-					headers: {
-						Authorization: `Bearer ${apiKey}`,
-						"Content-Type": "application/json",
-						"HTTP-Referer": "https://ravena.local",
-						"X-Title": "RavenaBot"
-					},
-					timeout: options.timeout ?? this.apiTimeout
+			// Monta o conteúdo do user message (texto simples ou array com imagens para vision)
+			let userContent;
+			const hasImages = !!(options.image || (options.images && options.images.length > 0));
+			if (hasImages) {
+				const imagesToProcess = options.images ? options.images : [options.image];
+				userContent = [{ type: "text", text: options.prompt }];
+				for (const img of imagesToProcess) {
+					if (img.startsWith("data:image")) {
+						userContent.push({
+							type: "image_url",
+							image_url: { url: img }
+						});
+					} else {
+						let mime = "image/jpeg";
+						if (img.startsWith("/9j/")) mime = "image/jpeg";
+						else if (img.startsWith("iVBOR")) mime = "image/png";
+						else if (img.startsWith("R0lGO")) mime = "image/gif";
+						else if (img.startsWith("UklGR")) mime = "image/webp";
+						userContent.push({
+							type: "image_url",
+							image_url: { url: `data:${mime};base64,${img}` }
+						});
+					}
 				}
-			);
+			} else {
+				userContent = options.prompt;
+			}
+
+			const payload = {
+				model,
+				messages: [
+					{ role: "system", content: ctxInclude },
+					{ role: "user", content: userContent }
+				],
+				max_tokens: options.maxTokens ?? 5000,
+				temperature: options.temperature ?? 0.7
+			};
+
+			if (options.response_format) {
+				payload.response_format = options.response_format;
+			}
+
+			const response = await axios.post(endpoint, payload, {
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					"Content-Type": "application/json",
+					"HTTP-Referer": "https://ravena.local",
+					"X-Title": "RavenaBot"
+				},
+				timeout: options.timeout ?? this.apiTimeout
+			});
 
 			this._trackUsage("OpenRouter", response.data, model, options);
 
@@ -581,7 +645,7 @@ class LLMService {
 	_cleanResponse(response) {
 		if (typeof response !== "string") return response;
 
-		return response
+		let cleaned = response
 			.replace(/<think>.*?<\/think>/gs, "")
 			.replace(/<\|think\|>.*?<channel\|>/gs, "")
 			.replace(/<\|thought\|>.*?<\|thought_end\|>/gs, "")
@@ -592,8 +656,14 @@ class LLMService {
 			.replace(/<channel\|>/g, "")
 			.replace(/<\|turn\|>/g, "")
 			.replace(/<turn\|>/g, "")
-			.trim()
-			.replace(/^"|"$/g, "");
+			.trim();
+
+		// Remove blocos de código Markdown (por exemplo, ```json ... ``` ou ``` ... ```) se existirem
+		if (cleaned.startsWith("```")) {
+			cleaned = cleaned.replace(/^```(?:json)?\n?|```$/g, "").trim();
+		}
+
+		return cleaned.replace(/^"|"$/g, "");
 	}
 
 	/**
@@ -853,7 +923,7 @@ class LLMService {
 
 			case "openai":
 			default:
-				response = await this.openAICompletion(options);
+				response = await this.openaiCompletion(options);
 				if (
 					!response ||
 					!response.choices ||

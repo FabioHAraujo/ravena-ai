@@ -38,6 +38,8 @@ const convertAsync = promisify(imagemagick.convert);
 class WhatsAppBotGo {
 	constructor(options) {
 		this.id = options.id;
+		this.nomeExibir = options.nomeExibir;
+		this.sendJoinInfo = options.sendJoinInfo;
 		this.vip = options.vip;
 		this.comunitario = options.comunitario;
 		this.numeroResponsavel = options.numeroResponsavel;
@@ -70,14 +72,14 @@ class WhatsAppBotGo {
 		this.redisURL = options.redisURL;
 		this.redisDB = options.redisDB ?? 0;
 		this.redisTTL = options.redisTTL ?? 604800;
-		this.maxCacheSize = 3000;
+		this.maxCacheSize = 1000;
 
 		this.streamIgnoreGroups = [];
 		this.skipGroupInfo = [];
 		this.messageCache = [];
 		this.contactCache = [];
 		this.sentMessagesCache = [];
-		this.cacheManager = new CacheManager(
+		this.cacheManager = CacheManager.getInstance(
 			this.redisURL,
 			this.redisDB,
 			this.redisTTL,
@@ -110,6 +112,8 @@ class WhatsAppBotGo {
 		this.otherBots = options.otherBots ?? [];
 
 		this.ignorePV = options.ignorePV ?? false;
+		this.updateStatus = options.updateStatus ?? true;
+		this.aiPersonality = options.aiPersonality ?? "";
 		this.autoDownloadPV = options.autoDownloadPV ?? false;
 		this.whitelist = options.whitelistPV ?? [];
 		this.ignoreInvites = options.ignoreInvites ?? false;
@@ -1197,6 +1201,8 @@ class WhatsAppBotGo {
 				results.push(result);
 
 				if (result && result.id?._serialized) {
+					// O bot está reagindo à PRÓPRIA mensagem enviada, isto não é interessante. Deve ser commented out no código.
+					/*
 					if (message.reaction) {
 						// CORRETO: ReturnMessage só tem um reaction
 						try {
@@ -1207,7 +1213,9 @@ class WhatsAppBotGo {
 								reactError
 							);
 						}
-					} else if (message.reactions) {
+					}
+					*/
+					if (message.reactions) {
 						// ERRADO: Apenas Command deveria ter mais de 1 reação, então isso deve ser arrumado
 						// Esse código precisa ser excluído depois de arrumar todas as ReturnMessage erradas
 						this.logger.debug(
@@ -1296,6 +1304,7 @@ class WhatsAppBotGo {
 		try {
 			// Webhook Setup
 			this.webhookApp = express();
+			this.webhookApp.set("trust proxy", true);
 			this.webhookApp.use(express.json({ limit: "500mb" }));
 			this.webhookApp.use(express.urlencoded({ extended: true, limit: "500mb" }));
 
@@ -1328,12 +1337,18 @@ class WhatsAppBotGo {
 	}
 
 	async _checkInstanceStatusAndConnect(isRetry = false, forceConnect = false) {
-		//this.logger.info(`Checking instance status for ${this.instanceName}...`);
 		try {
 			let response;
 			try {
 				response = await this.apiClient.get(`/instance/status`);
 			} catch (e) {
+				if (e && e.status === 401) {
+					this.isConnected = false;
+					return {
+						instanceDetails: { version: this.version, tipo: "whatsgoapi" },
+						extra: { connectData: this.connectDataCache?.data || {} }
+					};
+				}
 				this.logger.error(
 					`[_checkInstanceStatusAndConnect] Erro buscando status de ${this.instanceName}`,
 					e
@@ -1342,91 +1357,138 @@ class WhatsAppBotGo {
 			}
 
 			const statusData = response?.data;
-			this.isConnected = statusData?.Connected && statusData?.LoggedIn;
-			const state = this.isConnected ? "CONNECTED" : "DISCONNECTED";
+			// Connected = websocket WA estabelecido; LoggedIn = sessão autenticada
+			const wsConnected = !!statusData?.Connected;
+			this.isConnected = wsConnected && !!statusData?.LoggedIn;
+
+			const instanceDetails = { version: this.version, tipo: "whatsgoapi" };
 			const extra = {};
 
-			const instanceDetails = {
-				version: this.version,
-				tipo: "whatsgoapi"
-			};
+			if (statusData?.lastPasskeyRequest) {
+				extra.lastPasskeyRequest = statusData.lastPasskeyRequest;
+			}
 
+			// Totalmente conectado e logado
 			if (this.isConnected) {
 				this._onInstanceConnected();
 				extra.ok = true;
-			} else {
-				if (forceConnect) {
-					this.logger.info(
-						`Instance ${this.instanceName} is not connected. Attempting to connect...`
-					);
+				this.connectDataCache = null;
+				this._connectingPromise = null;
+				return { instanceDetails, extra };
+			}
 
-					const connectResponse = await this.apiClient.post(
-						`/instance/connect`,
-						{
-							webhookUrl: `${this.webhookHost}:${this.webhookPort}/webhook/${this.instanceName}`,
-							subscribe: [
-								"MESSAGE",
-								"SEND_MESSAGE",
-								"READ_RECEIPT",
-								"PRESENCE",
-								"CHAT_PRESENCE",
-								"CALL",
-								"CONNECTION",
-								"LABEL",
-								"CONTACT",
-								"GROUP",
-								"NEWSLETTER",
-								"QRCODE"
-							]
-						},
-						false
-					);
+			// Não logado — busca QR/pairing code se cache expirou
+			{
+				const now = Date.now();
+				const cacheValid = this.connectDataCache && now - this.connectDataCache.timestamp < 55000;
 
-					extra.connectData = {};
+				if (!cacheValid) {
+					if (this._connectingPromise) {
+						// Já tem uma operação em andamento, espera ela terminar
+						await this._connectingPromise;
+					} else {
+						// Bloqueia requests paralelos imediatamente
+						this.connectDataCache = { timestamp: now, data: {} };
 
-					if (connectResponse.message === "success") {
-						const pairingCodeResponse = await this.apiClient.post(
-							`/instance/pair`,
-							{ phone: this.phoneNumber },
-							false
-						);
-						const qrCodeResponse = await this.apiClient.get(`/instance/qr`, {}, false);
+						this._connectingPromise = (async () => {
+							try {
+								const connectData = {};
 
-						this.logger.debug(`ConnectResponses:`, {
-							phone: this.phoneNumber,
-							pairingCodeResponse,
-							qrCodeResponse
-						});
+								if (!wsConnected) {
+									// WS não estabelecido: precisa conectar primeiro
+									this.logger.info(`[${this.id}] WS desconectado. Chamando /instance/connect...`);
+									const connectResponse = await this.apiClient.post(
+										`/instance/connect`,
+										{
+											webhookUrl: `${this.webhookHost}:${this.webhookPort}/webhook/${this.instanceName}`,
+											subscribe: [
+												"MESSAGE",
+												"SEND_MESSAGE",
+												"READ_RECEIPT",
+												"PRESENCE",
+												"CHAT_PRESENCE",
+												"CALL",
+												"CONNECTION",
+												"LABEL",
+												"CONTACT",
+												"GROUP",
+												"NEWSLETTER",
+												"QRCODE"
+											]
+										},
+										false
+									);
 
-						extra.connectData.pairingCode = pairingCodeResponse?.data?.PairingCode;
-						extra.connectData.qrCode = qrCodeResponse?.data?.Qrcode; // code é base64, qrcode é a string
-						extra.connectData.code = qrCodeResponse?.data?.Code; // code é base64, qrcode é a string
-					}
+									if (connectResponse.message !== "success") {
+										this.logger.warn(`[${this.id}] Connect retornou: ${connectResponse.message}`);
+										this.connectDataCache = null;
+										return;
+									}
 
-					if (extra.connectData.pairingCode) {
-						this.logger.info(`[${this.id}] PAIRING CODE: ${extra.connectData.pairingCode}`);
-					} else if (extra.connectData.code || extra.connectData.qrcode) {
-						const qrBase64 = extra.connectData.code ?? extra.connectData.qrcode;
-						if (qrBase64) {
-							this.logger.info(`[${this.id}] QR Code received.`);
-							const qrCodeLocal = path.join(
-								this.database.databasePath,
-								"qrcodes",
-								`qrcode_${this.id}.png`
-							);
-							const base64Data = qrBase64.replace(/^data:image\/png;base64,/, "");
-							fs.writeFileSync(qrCodeLocal, base64Data, "base64");
-						}
+									// Aguarda o WS do WA inicializar antes de pedir pair
+									this.logger.info(
+										`[${this.id}] Connect ok. Aguardando 8s para o WA inicializar...`
+									);
+									await new Promise((resolve) => setTimeout(resolve, 8000));
+								} else {
+									// WS já está up (Connected=true, LoggedIn=false)
+									// Só precisa buscar pair/qr, sem reconectar
+									this.logger.info(`[${this.id}] WS já conectado. Buscando pair/qr diretamente...`);
+								}
+
+								const pairingCodeResponse = await this.apiClient.post(
+									`/instance/pair`,
+									{ phone: this.phoneNumber },
+									false
+								);
+								const qrCodeResponse = await this.apiClient.get(`/instance/qr`, {}, false);
+
+								connectData.pairingCode = pairingCodeResponse?.data?.PairingCode || "";
+								connectData.qrCode = qrCodeResponse?.data?.Qrcode || "";
+								connectData.code = qrCodeResponse?.data?.Code || "";
+
+								this.logger.info(
+									`[${this.id}] PairingCode: ${connectData.pairingCode || "(vazio)"}, QR: ${connectData.qrCode ? "ok" : "(vazio)"}`
+								);
+
+								this.connectDataCache = {
+									timestamp: connectData.qrCode ? now : now - 52000,
+									data: connectData
+								};
+
+								if (connectData.qrCode) {
+									const qrCodeLocal = path.join(
+										this.database.databasePath,
+										"qrcodes",
+										`qrcode_${this.id}.png`
+									);
+									const base64Data = connectData.qrCode.replace(/^data:image\/png;base64,/, "");
+									fs.writeFileSync(qrCodeLocal, base64Data, "base64");
+								}
+
+								if (connectData.pairingCode) {
+									this.logger.info(`[${this.id}] PAIRING CODE: ${connectData.pairingCode}`);
+								}
+							} catch (connectErr) {
+								this.logger.error(`[${this.id}] Erro no connect/pair:`, connectErr);
+								this.connectDataCache = null;
+							} finally {
+								this._connectingPromise = null;
+							}
+						})();
+
+						await this._connectingPromise;
 					}
 				}
 			}
+
+			extra.connectData = this.connectDataCache?.data || {};
 			return { instanceDetails, extra };
 		} catch (error) {
 			this.logger.error(`Error checking/connecting instance ${this.instanceName}:`, error);
-			return { instanceDetails: {}, error };
+			return { instanceDetails: { version: this.version, tipo: "whatsgoapi" }, extra: {}, error };
 		}
 	}
-
 	async _onInstanceConnected() {
 		if (this.streamSystem) {
 			this.streamSystem.initialize();
@@ -1576,7 +1638,16 @@ class WhatsAppBotGo {
 							this._handleGroupParticipantsUpdate(groupInfoData);
 						}
 
-						// Se mudou de nome, groupInfoData.Name Name: {Name: 'Novo Titulo',NameSetAt: '2025-11-24T16:57:49-03:00',NameSetBy: '123456@lid',NameSetByPN: '5599123456@s.whatsapp.net'}
+						// Evento de mudança de configuração de mensagens (abrir/fechar grupo)
+						if (groupInfoData.Announce) {
+							if (this.eventHandler?.onGroupSettingsUpdate) {
+								this.eventHandler.onGroupSettingsUpdate(this, {
+									groupId: groupInfoData.JID,
+									announce: groupInfoData.Announce.IsAnnounce,
+									sender: groupInfoData.SenderPN || groupInfoData.Sender
+								});
+							}
+						}
 					}
 					break;
 				}
@@ -1635,6 +1706,81 @@ class WhatsAppBotGo {
 					}
 					break;
 				}
+				case "QRCode": {
+					// Atualiza o cache local com o QRCode mais recente recebido via webhook
+					const qrData = payload.data;
+					if (qrData) {
+						const qrCodeBase64 = qrData.qrcode || ""; // data:image/png;base64,...
+						const qrCode = qrData.code || "";
+
+						this.connectDataCache = {
+							timestamp: Date.now(),
+							data: {
+								...(this.connectDataCache?.data || {}),
+								qrCode: qrCodeBase64,
+								code: qrCode
+							}
+						};
+
+						this.logger.info(
+							`[${this.id}] QRCode recebido via webhook (count=${qrData.count}/${qrData.maxCount}). Cache atualizado.`
+						);
+
+						// Salva PNG no disco (mesma lógica da rota /instance/qr)
+						if (qrCodeBase64) {
+							try {
+								const qrCodeLocal = path.join(
+									this.database.databasePath,
+									"qrcodes",
+									`qrcode_${this.id}.png`
+								);
+								const base64Data = qrCodeBase64.replace(/^data:image\/png;base64,/, "");
+								fs.mkdirSync(path.dirname(qrCodeLocal), { recursive: true });
+								fs.writeFileSync(qrCodeLocal, base64Data, "base64");
+							} catch (qrSaveErr) {
+								this.logger.warn(`[${this.id}] Falha ao salvar QRCode PNG:`, qrSaveErr);
+							}
+						}
+					}
+					break;
+				}
+
+				case "QRTimeout": {
+					this.connectDataCache = null;
+					this.logger.info(`[${this.id}] QR Code expirado (QRTimeout). Cache limpo.`);
+					break;
+				}
+
+				case "Connected": {
+					this.logger.info(
+						`[${this.id}] Evento de conexão bem sucedida recebido via webhook (Connected).`
+					);
+					break;
+				}
+
+				case "Disconnected":
+				case "ConnectFailure": {
+					const reason = payload.data?.Reason || payload.data?.message || "Desconexão via Webhook";
+					this.logger.warn(
+						`[${this.id}] Evento de desconexão recebido via webhook (${payload.event}). Razão: ${reason}`
+					);
+					break;
+				}
+
+				case "LoggedOut": {
+					this.logger.warn(`[${this.id}] Evento LoggedOut recebido via webhook.`);
+					break;
+				}
+
+				case "CallOffer":
+				case "CallOfferNotice": {
+					const caller = payload.data?.CallCreator || payload.data?.sender || "desconhecido";
+					this.logger.info(
+						`[${this.id}] Recebida notificação de chamada (${payload.event}) de: ${caller}`
+					);
+					break;
+				}
+
 				case "ChatPresence":
 					break;
 				case "Receipt":
@@ -1672,6 +1818,7 @@ class WhatsAppBotGo {
 			this.blockedContacts = [];
 		}
 		for (const bot of this.otherBots) {
+			if (!bot || typeof bot !== "string") continue; // skip null/undefined entries
 			// Assuming otherBots is an array of JID-like strings or bot IDs
 			const botId = bot.endsWith("@c.us") || bot.endsWith("@s.whatsapp.net") ? bot : `${bot}@c.us`; // Basic normalization
 			if (!this.blockedContacts.some((c) => c.id._serialized === botId)) {
@@ -1714,7 +1861,7 @@ class WhatsAppBotGo {
 			}
 
 			const chatId = info.Chat;
-			const isGroup = info.IsGroup || chatId.includes("broadcast");
+			const isGroup = info.IsGroup || chatId.includes("@g.us") || chatId.includes("broadcast");
 			const fromMe = info.IsFromMe;
 			const id = info.ID;
 			const timestamp = new Date(info.Timestamp).getTime() / 1000;
@@ -1723,7 +1870,8 @@ class WhatsAppBotGo {
 			const senderAlt = info.SenderAlt; // geralmente LID
 
 			if (!pushName || pushName?.length < 1) {
-				pushName = (await this.fetchPushNameFromCache(id)) ?? "Usuario";
+				const cacheObj = await this.fetchPushNameFromCache(senderAlt || sender);
+				pushName = cacheObj?.pushName ?? cacheObj ?? "Usuario";
 			}
 
 			// Context Info (Reply/Mentions)
@@ -1762,55 +1910,47 @@ class WhatsAppBotGo {
 			} else if (messageContent.imageMessage) {
 				type = "image";
 				caption = messageContent.imageMessage.caption;
-				const downloaded = await this._downloadMediaFromWhatsgo(messageContent);
+				// Removido download automático para economizar RAM (15+ bots ativos)
+				// A mídia será baixada sob demanda via message.downloadMedia()
 				mediaInfo = {
 					mimetype: messageContent.imageMessage.mimetype,
-					url: downloaded?.url ?? messageContent.imageMessage.url,
-					data: downloaded?.base64,
+					url: messageContent.imageMessage.url,
 					_mediaDetails: messageContent.imageMessage
 				};
 				content = mediaInfo;
 			} else if (messageContent.videoMessage) {
 				type = "video";
 				caption = messageContent.videoMessage.caption;
-				const downloaded = await this._downloadMediaFromWhatsgo(messageContent);
 				mediaInfo = {
 					mimetype: messageContent.videoMessage.mimetype,
-					url: downloaded?.url ?? messageContent.videoMessage.url,
-					data: downloaded?.base64,
+					url: messageContent.videoMessage.url,
 					seconds: messageContent.videoMessage.seconds,
 					_mediaDetails: messageContent.videoMessage
 				};
 				content = mediaInfo;
 			} else if (messageContent.audioMessage) {
 				type = "audio";
-				const downloaded = await this._downloadMediaFromWhatsgo(messageContent);
 				mediaInfo = {
 					mimetype: messageContent.audioMessage.mimetype,
-					url: downloaded?.url ?? messageContent.audioMessage.url,
-					data: downloaded?.base64,
+					url: messageContent.audioMessage.url,
 					seconds: messageContent.audioMessage.seconds,
 					_mediaDetails: messageContent.audioMessage
 				};
 				content = mediaInfo;
 			} else if (messageContent.stickerMessage) {
 				type = "sticker";
-				const downloaded = await this._downloadMediaFromWhatsgo(messageContent);
 				mediaInfo = {
 					mimetype: messageContent.stickerMessage.mimetype,
-					url: downloaded?.url ?? messageContent.stickerMessage.url,
-					data: downloaded?.base64,
+					url: messageContent.stickerMessage.url,
 					_mediaDetails: messageContent.stickerMessage
 				};
 				content = mediaInfo;
 			} else if (messageContent.documentMessage) {
 				type = "document";
 				caption = messageContent.documentMessage.caption;
-				const downloaded = await this._downloadMediaFromWhatsgo(messageContent);
 				mediaInfo = {
 					mimetype: messageContent.documentMessage.mimetype,
-					url: downloaded?.url ?? messageContent.documentMessage.url,
-					data: downloaded?.base64,
+					url: messageContent.documentMessage.url,
 					filename: messageContent.documentMessage.fileName,
 					title: messageContent.documentMessage.title,
 					_mediaDetails: messageContent.documentMessage
@@ -1851,6 +1991,8 @@ class WhatsAppBotGo {
 				responseTime,
 				hasMedia: !!mediaInfo,
 				mentions,
+				quotedParticipant,
+				hasQuotedMsg: !!quotedMessageId,
 				isQuoted: goMessageData.isQuoted,
 				isNewsletter: chatId.includes("newsletter"),
 
@@ -1918,7 +2060,38 @@ class WhatsAppBotGo {
 			};
 
 			if (!skipCache) {
-				this.cacheManager.putGoMessageInCache(formattedMessage);
+				// Para evitar modificar o objeto original in-place, clonamos goMessageData e origin.
+				const cachedMessage = {
+					...formattedMessage,
+					goMessageData: formattedMessage.goMessageData
+						? {
+								...formattedMessage.goMessageData,
+								groupData: formattedMessage.goMessageData.groupData
+									? { ...formattedMessage.goMessageData.groupData }
+									: undefined
+							}
+						: undefined,
+					origin: formattedMessage.origin
+						? {
+								...formattedMessage.origin,
+								groupData: formattedMessage.origin.groupData
+									? { ...formattedMessage.origin.groupData }
+									: undefined
+							}
+						: undefined
+				};
+
+				// Limpa dados pesados antes de salvar no cache para economizar espaço e I/O
+				if (cachedMessage.goMessageData?.groupData) {
+					delete cachedMessage.goMessageData.groupData.Participants;
+					delete cachedMessage.goMessageData.groupData.Topic;
+				}
+				if (cachedMessage.origin?.groupData) {
+					delete cachedMessage.origin.groupData.Participants;
+					delete cachedMessage.origin.groupData.Topic;
+				}
+
+				this.cacheManager.putGoMessageInCache(cachedMessage);
 			}
 
 			return formattedMessage;
@@ -1994,6 +2167,12 @@ class WhatsAppBotGo {
 						? "video"
 						: (mime.lookup(content.split("?")[0]).split("/")[0] ?? "document");
 
+					// Se sendVideoAsGif estiver ativo e o tipo for vídeo, use "gif" para que a API Go
+					// envie com GifPlayback=true (reprodução automática sem controles de vídeo)
+					if (options.sendVideoAsGif && payload.type === "video") {
+						payload.type = "gif";
+					}
+
 					this.logger.debug(`[sendMessage] Content is URL! `, { endpoint, payload });
 				} else {
 					endpoint = "/send/text";
@@ -2036,6 +2215,12 @@ class WhatsAppBotGo {
 						mediaType = "document";
 						// Se enviar como doc, manda a nossa URL publica junto também
 						payload.caption += `\n\n> Link temporário: ${urlPublica}`;
+					}
+
+					// Se sendVideoAsGif estiver ativo e o tipo for vídeo, use "gif" para que a API Go
+					// envie com GifPlayback=true (reprodução automática sem controles de vídeo)
+					if (options.sendVideoAsGif && mediaType === "video") {
+						mediaType = "gif";
 					}
 
 					payload.type = mediaType.split("/")[0];
@@ -2198,6 +2383,21 @@ class WhatsAppBotGo {
 		}
 	}
 
+	async addToGroup(groupJid, participants) {
+		try {
+			this.logger.info(
+				`[addToGroup][${this.instanceName}] Adicionando ${participants.length} ao grupo ${groupJid}`
+			);
+			return await this.apiClient.post(`/group/participant`, {
+				groupJid,
+				action: "add",
+				participants: Array.isArray(participants) ? participants : [participants]
+			});
+		} catch (e) {
+			this.logger.error(`[addToGroup][${this.instanceName}] Erro ao adicionar participantes:`, e);
+		}
+	}
+
 	async removeFromCommunity(communityJid, participants) {
 		try {
 			this.logger.info(
@@ -2310,8 +2510,22 @@ class WhatsAppBotGo {
 						// Métodos do wwebjs
 						setSubject: async (title) =>
 							await this.apiClient.post(`/group/name`, { groupJid: chatId, name: title }),
+						addParticipants: async (participants) => await this.addToGroup(chatId, participants),
+						removeParticipants: async (participants) =>
+							await this.removeFromGroup(chatId, participants),
 						fetchMessages: async (limit = 30) => false,
-						setMessagesAdminsOnly: async (adminOnly) => false,
+						setMessagesAdminsOnly: async (adminOnly) => {
+							try {
+								const response = await this.apiClient.post(`/group/announce`, {
+									groupJid: chatId,
+									announce: adminOnly
+								});
+								return response.data;
+							} catch (err) {
+								this.logger.error(`[chat] setMessagesAdminsOnly failed:`, err);
+								throw err;
+							}
+						},
 						setPicture: async (picture) => {
 							this.logger.debug(`[chat] setPicture`, { type: "url", url: picture.url });
 
@@ -2462,7 +2676,8 @@ class WhatsAppBotGo {
 
 		let cacheName;
 		try {
-			cacheName = await this.fetchPushNameFromCache(id);
+			const cacheObj = await this.fetchPushNameFromCache(id);
+			cacheName = cacheObj?.pushName ?? cacheObj;
 			returnData.name = cacheName ?? returnData.name;
 		} catch (e) {
 			// Ignore
@@ -2632,12 +2847,13 @@ class WhatsAppBotGo {
 			this.logger.debug(`[setCttBlockStatus][${this.instanceName}] '${ctt}' => '${blockStatus}'`);
 
 			if (ctt.includes("@")) {
-				ctt = ctt.split("@")[0] + "@s.whatsapp.net";
+				const suffix = ctt.endsWith("@lid") ? "@lid" : "@s.whatsapp.net";
+				ctt = ctt.split("@")[0] + suffix;
 			}
 
 			const resp = await this.apiClient.post(`/user/${blockStatus}`, { number: ctt });
 
-			return resp.accepted;
+			return resp && resp.message === "success";
 		} catch (e) {
 			this.logger.warn(`[setCttBlockStatus] Erro setando blockStatus ${blockStatus} para '${ctt}'`);
 			throw e;

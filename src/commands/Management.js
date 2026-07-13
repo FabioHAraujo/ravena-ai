@@ -120,6 +120,11 @@ class Management {
 				method: "setCmdInteragir",
 				description: "Define que comando seja usado nas interações aleatórias"
 			},
+			"cmd-cd": {
+				method: "setCmdCooldown",
+				description:
+					"Define o cooldown (em segundos) de um comando personalizado. Uso: !g-cmd-cd <comando> <segundos>"
+			},
 			"cmd-setHoras": {
 				method: "setCmdAllowedHours",
 				description: "Define horários permitidos para um comando"
@@ -184,6 +189,20 @@ class Management {
 				method: "setInteractionChance",
 				description: "Define a chance de ocorrer interações automáticas"
 			},
+			"interagir-proporcao": {
+				method: "setInteractionProportion",
+				description: "Define a proporção entre comandos e IA para interações automáticas"
+			},
+			ban: {
+				method: "banUser",
+				description: "Remove membros mencionados do grupo",
+				hidden: true
+			},
+			block: {
+				method: "blockGroupUser",
+				description: "Remove membros mencionados do grupo e impede reentrada",
+				hidden: true
+			},
 			fechar: {
 				method: "closeGroup",
 				description: "Fecha o grupo (apenas admins enviam msgs)"
@@ -192,9 +211,17 @@ class Management {
 				method: "openGroup",
 				description: "Abre o grupo (todos podem envar msgs)"
 			},
+			"notificar-grupoFechado": {
+				method: "toggleNotificaGrupoFechado",
+				description: "Ativa/desativa a notificação quando o grupo é fechado"
+			},
+			"notificar-grupoAberto": {
+				method: "toggleNotificaGrupoAberto",
+				description: "Ativa/desativa a notificação quando o grupo é aberto"
+			},
 			setPersonalidade: {
 				method: "setPersonalidadeIA",
-				description: "Define uma personalidade para os comandos de IA (max. 500 caracteres)"
+				description: "Define uma personalidade para os comandos de IA (max. 1500 caracteres)"
 			},
 			setApelido: {
 				method: "setUserNicknameAdmin",
@@ -343,6 +370,10 @@ class Management {
 			dossie: {
 				method: "runDossieAnalysis",
 				description: "Exibe o histórico de dossiês deste grupo"
+			},
+			copiarCmds: {
+				method: "copyCommands",
+				description: "Copia os comandos do grupoOrigem pro grupoDestino"
 			}
 		};
 
@@ -369,6 +400,7 @@ class Management {
 
 		// Constrói objeto de comandos a partir do commandMap
 		for (const [cmdName, cmdData] of Object.entries(this.commandMap)) {
+			if (cmdData.hidden) continue;
 			commands[cmdName] = {
 				description: cmdData.description ?? "Sem descrição disponível",
 				method: cmdData.method
@@ -472,7 +504,17 @@ class Management {
 			});
 		}
 
-		const newName = args.join(" ");
+		const rawName = args[0].trim(); // Apenas o primeiro argumento (sem espaços) trimmed
+
+		// Valida: apenas letras, números, _, - e . ; entre 1 e 30 caracteres
+		if (!/^[a-zA-Z0-9_\-.]{1,30}$/.test(rawName)) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `❌ Nome inválido. O nome deve conter apenas letras, números, _, - e ., sem espaços, com no máximo 30 caracteres. Exemplo: !g-setName meuGrupo_01`
+			});
+		}
+
+		const newName = rawName.toLowerCase();
 
 		const grupoExistente = await this.database.getGroupByName(newName);
 
@@ -488,7 +530,7 @@ class Management {
 		}
 
 		// Atualiza nome do grupo no banco de dados
-		group.name = newName.toLowerCase().replace(/\s+/g, "").substring(0, 21);
+		group.name = newName;
 		await this.database.saveGroup(group);
 
 		return new ReturnMessage({
@@ -555,8 +597,18 @@ class Management {
 			bodyTexto = quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body ?? quotedMsg._data.body;
 		}
 
-		if (commandTrigger.startsWith(group.prefix)) {
-			commandTrigger = commandTrigger.replace(group.prefix, "");
+		const prefix = (group.prefix || "!").trim();
+		if (commandTrigger.startsWith(prefix)) {
+			commandTrigger = commandTrigger.substring(prefix.length).trim();
+		} else if (prefix !== "!" && commandTrigger.startsWith("!")) {
+			commandTrigger = commandTrigger.substring(1).trim();
+		}
+
+		if (!commandTrigger) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "⚠️ Por favor, forneça um gatilho de comando válido."
+			});
 		}
 
 		if (commandTrigger.split(/\s+/).length > 10) {
@@ -731,6 +783,19 @@ class Management {
 			}
 		} else {
 			bodyTexto = quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body ?? quotedMsg._data.body;
+		}
+		const prefix = (group.prefix || "!").trim();
+		if (commandTrigger.startsWith(prefix)) {
+			commandTrigger = commandTrigger.substring(prefix.length).trim();
+		} else if (prefix !== "!" && commandTrigger.startsWith("!")) {
+			commandTrigger = commandTrigger.substring(1).trim();
+		}
+
+		if (!commandTrigger) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "⚠️ Por favor, forneça um gatilho de comando válido."
+			});
 		}
 
 		// MELHORIA: Usa o comando completo como gatilho em vez de apenas a primeira palavra
@@ -1582,6 +1647,7 @@ class Management {
   *!g-setDespedida* <mensagem> - Define mensagem de despedida para membros que saem
   *!g-info* - Mostra informações detalhadas do grupo
   *!g-manage* <nomeGrupo> - Gerencia um grupo a partir de chat privado
+  *!g-copiarCmds* <grupoOrigem> <grupoDestino> - Copia comandos personalizados de um grupo para outro (estilo rsync)
 
   *Comandos de Filtro:*
   *!g-filtro-palavra* <palavra> - Adiciona/remove palavra do filtro
@@ -1703,7 +1769,7 @@ class Management {
 			// Constrói mensagem informativa
 			let infoMessage = `*📊 Informações do Grupo*\n\n`;
 			infoMessage += `*Nome:* ${group.name}\n`;
-			infoMessage += `*ID WhatsApp:* ${group.id}\n`;
+			infoMessage += `*ID:* ${group.id}\n`;
 			infoMessage += `*Prefixo:* "${group.prefix}"\n`;
 			infoMessage += `*Data de Criação:* ${creationDate}\n`;
 			infoMessage += `*Pausado:* ${group.paused ? "Sim" : "Não"}\n\n`;
@@ -1730,13 +1796,17 @@ class Management {
 			infoMessage += `*Respostas Automáticas:*\n`;
 			infoMessage += `- *Boas-vindas:* \`\`\`${welcomeMessage}\`\`\`\n`;
 			infoMessage += `- *Despedidas:* \`\`\`${farewellMessage}\`\`\`\n`;
-			infoMessage += `- *Auto-STT:* ${group.autoStt ? "Sim" : "Não"}\n\n`;
+			infoMessage += `- *Auto-STT:* ${group.autoStt ? "Sim" : "Não"}\n`;
+			infoMessage += `- *Notificar Fechado:* ${group.notificaGrupoFechado ? "Sim" : "Não"}\n`;
+			infoMessage += `- *Notificar Aberto:* ${group.notificaGrupoAberto ? "Sim" : "Não"}\n\n`;
 
 			if (group.interact) {
 				infoMessage += `*Interações Automáticas:*\n`;
 				infoMessage += `- *Ativado:* ${group.interact.enabled ? "Sim" : "Não"}\n`;
 				infoMessage += `- *Chance:* ${group.interact.chance / 100}% (${group.interact.chance}/10000)\n`;
-				infoMessage += `- *Cooldown:* ${group.interact.cooldown} minutos\n\n`;
+				infoMessage += `- *Cooldown:* ${group.interact.cooldown} minutos\n`;
+				const proporcao = group.interact.proporcao !== undefined ? group.interact.proporcao : 50;
+				infoMessage += `- *Proporção:* ${proporcao}% IA, ${100 - proporcao}% comandos\n\n`;
 			}
 
 			infoMessage += `*Filtros:*\n`;
@@ -1806,6 +1876,10 @@ class Management {
 				for (const channel of twitchChannels) {
 					infoMessage += `- *${channel.channel}*:\n`;
 
+					if (channel.pausedUntil && new Date(channel.pausedUntil) > new Date()) {
+						infoMessage += `  • Status: ⏸️ *PAUSADO* (até ${new Date(channel.pausedUntil).toLocaleString("pt-BR")})\n`;
+					}
+
 					// Tipos de mídia configurados para online/offline
 					const onlineMedia = formatMediaConfig(channel.onConfig);
 					const offlineMedia = formatMediaConfig(channel.offConfig);
@@ -1848,6 +1922,10 @@ class Management {
 				for (const channel of kickChannels) {
 					infoMessage += `- *${channel.channel}*:\n`;
 
+					if (channel.pausedUntil && new Date(channel.pausedUntil) > new Date()) {
+						infoMessage += `  • Status: ⏸️ *PAUSADO* (até ${new Date(channel.pausedUntil).toLocaleString("pt-BR")})\n`;
+					}
+
 					// Tipos de mídia configurados para online/offline
 					const onlineMedia = formatMediaConfig(channel.onConfig);
 					const offlineMedia = formatMediaConfig(channel.offConfig);
@@ -1887,6 +1965,10 @@ class Management {
 
 				for (const channel of youtubeChannels) {
 					infoMessage += `- *${channel.channel}*:\n`;
+
+					if (channel.pausedUntil && new Date(channel.pausedUntil) > new Date()) {
+						infoMessage += `  • Status: ⏸️ *PAUSADO* (até ${new Date(channel.pausedUntil).toLocaleString("pt-BR")})\n`;
+					}
 
 					// Tipos de mídia configurados
 					const mediaConfig = formatMediaConfig(channel.onConfig);
@@ -2294,7 +2376,7 @@ class Management {
 			// Zera mensagem
 			group.customAIPrompt = "";
 		} else {
-			group.customAIPrompt = args.join(" ").slice(0, 500);
+			group.customAIPrompt = args.join(" ").slice(0, 1500);
 		}
 
 		// Alterna estado do filtro
@@ -2443,6 +2525,92 @@ class Management {
 	}
 
 	/**
+	 * Define o cooldown personalizado de um comando
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async setCmdCooldown(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		if (args.length < 2) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"Por favor, forneça um nome de comando e o cooldown em segundos. Exemplo: !g-cmd-cd sticker 30"
+			});
+		}
+
+		const commandName = args[0];
+		const cooldownRaw = parseInt(args[1]);
+
+		if (isNaN(cooldownRaw)) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "O cooldown deve ser um número (em segundos). Exemplo: !g-cmd-cd sticker 30"
+			});
+		}
+
+		// Respeita o mínimo (1 segundo) e o máximo (60000 segundos ~16,6h)
+		const MIN_COOLDOWN = 1;
+		const MAX_COOLDOWN = 60000;
+		let cooldown = cooldownRaw;
+		let textoAjuste = "";
+
+		if (cooldown <= 0) {
+			cooldown = 0;
+			textoAjuste = " (cooldown removido)";
+		} else if (cooldown < MIN_COOLDOWN) {
+			cooldown = MIN_COOLDOWN;
+			textoAjuste = ` (mínimo: ${MIN_COOLDOWN}s)`;
+		} else if (cooldown > MAX_COOLDOWN) {
+			cooldown = MAX_COOLDOWN;
+			textoAjuste = ` (máximo: ${MAX_COOLDOWN}s)`;
+		}
+
+		// Verifica se é um comando personalizado
+		const customCommands = await this.database.getCustomCommands(group.id);
+		const customCommand = customCommands.find(
+			(cmd) => cmd.startsWith === commandName && !cmd.deleted
+		);
+
+		if (customCommand) {
+			customCommand.cooldown = cooldown;
+
+			// Atualiza o comando
+			await this.database.updateCustomCommand(group.id, customCommand);
+
+			// Limpa cache de comandos para garantir que o comando atualizado seja carregado
+			this.database.clearCache(`commands:${group.id}`);
+
+			// Recarrega comandos
+			await bot.eventHandler.commandHandler.loadCustomCommandsForGroup(group.id);
+
+			const msgCooldown =
+				cooldown === 0
+					? `Cooldown do comando '${commandName}' removido${textoAjuste}.`
+					: `Cooldown do comando '${commandName}' definido para ${cooldown} segundo(s)${textoAjuste}.`;
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `🕐 ${msgCooldown}`
+			});
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: `Comando personalizado '${commandName}' não encontrado.${this.help.naoEncontrado}`
+		});
+	}
+
+	/**
 	 * Alterna conversão automática de voz para texto em mensagens de voz em um grupo
 	 * @param {WhatsAppBot} bot - Instância do bot
 	 * @param {Object} message - Dados da mensagem
@@ -2468,6 +2636,64 @@ class Management {
 		const statusMsg = group.autoStt
 			? "Conversão automática de voz para texto agora está *ativada* para este grupo."
 			: "Conversão automática de voz para texto agora está *desativada* para este grupo.";
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: statusMsg
+		});
+	}
+
+	/**
+	 * Alterna a notificação automática quando o grupo é fechado
+	 * @param {WhatsAppBot} bot - A instância do bot
+	 * @param {Object} message - A mensagem recebida
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Group} group - O objeto do grupo
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async toggleNotificaGrupoFechado(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		group.notificaGrupoFechado = !group.notificaGrupoFechado;
+		await this.database.saveGroup(group);
+
+		const statusMsg = group.notificaGrupoFechado
+			? "🔔 Notificação automática de *grupo fechado* agora está *ativada*."
+			: "🔕 Notificação automática de *grupo fechado* agora está *desativada*.";
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: statusMsg
+		});
+	}
+
+	/**
+	 * Alterna a notificação automática quando o grupo é aberto
+	 * @param {WhatsAppBot} bot - A instância do bot
+	 * @param {Object} message - A mensagem recebida
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Group} group - O objeto do grupo
+	 * @returns {Promise<ReturnMessage>}
+	 */
+	async toggleNotificaGrupoAberto(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		group.notificaGrupoAberto = !group.notificaGrupoAberto;
+		await this.database.saveGroup(group);
+
+		const statusMsg = group.notificaGrupoAberto
+			? "🔔 Notificação automática de *grupo aberto* agora está *ativada*."
+			: "🔕 Notificação automática de *grupo aberto* agora está *desativada*.";
 
 		return new ReturnMessage({
 			chatId: group.id,
@@ -4270,7 +4496,8 @@ class Management {
 				useCmds: true,
 				chance: 100, // Padrão: 1%
 				cooldown: 30, // Padrão: 30 minutos
-				lastInteraction: 0
+				lastInteraction: 0,
+				proporcao: 50
 			};
 		}
 
@@ -4287,8 +4514,11 @@ class Management {
 
 		if (group.interact.enabled) {
 			response += `📊 Chance atual: ${group.interact.chance / 100}%\n`;
-			response += `🕐 Cooldown atual: ${group.interact.cooldown} minutos\n\n`;
-			response += "Use `!g-interagir-chance` e `!g-interagir-cd` para ajustar estes valores.";
+			response += `🕐 Cooldown atual: ${group.interact.cooldown} minutos\n`;
+			const proporcao = group.interact.proporcao !== undefined ? group.interact.proporcao : 50;
+			response += `⚖️ Proporção atual: ${proporcao}% IA, ${100 - proporcao}% comandos\n\n`;
+			response +=
+				"Use `!g-interagir-chance`, `!g-interagir-cd` e `!g-interagir-proporcao` para ajustar estes valores.";
 		}
 
 		return new ReturnMessage({
@@ -4320,7 +4550,8 @@ class Management {
 				useCmds: true,
 				chance: 100, // Padrão: 1%
 				cooldown: 30, // Padrão: 30 minutos
-				lastInteraction: 0
+				lastInteraction: 0,
+				proporcao: 50
 			};
 		}
 
@@ -4364,7 +4595,8 @@ class Management {
 				useCmds: true,
 				chance: 100, // Padrão: 1%
 				cooldown: 30, // Padrão: 30 minutos
-				lastInteraction: 0
+				lastInteraction: 0,
+				proporcao: 50
 			};
 		}
 
@@ -4422,8 +4654,13 @@ class Management {
 				useCmds: true,
 				chance: 100, // Padrão: 1%
 				cooldown: 30, // Padrão: 30 minutos
-				lastInteraction: 0
+				lastInteraction: 0,
+				proporcao: 50
 			};
+		}
+
+		if (group.interact.proporcao === undefined) {
+			group.interact.proporcao = 50;
 		}
 
 		// Verifica se valor de chance foi fornecido
@@ -4452,6 +4689,74 @@ class Management {
 		return new ReturnMessage({
 			chatId: group.id,
 			content: `📊 Chance de interações definida para ${chance / 100}%${textoMaximo}.`
+		});
+	}
+
+	/**
+	 * Define a proporção de interação automática (chance para IA vs comandos)
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async setInteractionProportion(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		// Inicializa objeto de interação se não existir
+		if (!group.interact) {
+			group.interact = {
+				enabled: false,
+				useCmds: true,
+				chance: 100, // Padrão: 1%
+				cooldown: 30, // Padrão: 30 minutos
+				lastInteraction: 0,
+				proporcao: 50
+			};
+		}
+
+		if (group.interact.proporcao === undefined) {
+			group.interact.proporcao = 50;
+		}
+
+		const helperText = `Para usar apenas *IA* na interação, envie:\n!g-interagir-proporcao 100\n\nPara usar apenas *comandos* na interação, envie:\n!g-interagir-proporcao 0`;
+
+		// Verifica se valor da proporção foi fornecido
+		if (args.length === 0 || isNaN(parseInt(args[0]))) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: `📊 Proporção de interação atual: ${group.interact.proporcao}% para IA e ${100 - group.interact.proporcao}% para comandos.\n\nUse !g-interagir-proporcao [0-100] para alterar.\n\n${helperText}`
+			});
+		}
+
+		// Analisa e valida a proporção
+		let proporcao = parseInt(args[0]);
+		if (proporcao < 0) proporcao = 0;
+		if (proporcao > 100) proporcao = 100;
+
+		// Atualiza proporção
+		group.interact.proporcao = proporcao;
+
+		// Salva mudanças
+		await this.database.saveGroup(group);
+
+		let fraseSimples = "";
+		if (proporcao === 100) {
+			fraseSimples = "Usando apenas *IA* para interagir";
+		} else if (proporcao === 0) {
+			fraseSimples = "Usando apenas *comandos* para interagir";
+		} else {
+			fraseSimples = `${100 - proporcao}% de chance de usar algum comando, ${proporcao}% de chance de usar IA para interagir`;
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: `📊 Proporção de interação definida para ${proporcao}% IA e ${100 - proporcao}% comandos.\n\n_${fraseSimples}_\n\n${helperText}`
 		});
 	}
 
@@ -4891,17 +5196,26 @@ class Management {
 		}
 
 		// 2. Se não encontrou na mensagem citada, verifica a mensagem atual
-		if (!mediaData && message.type === "image" && message.content && message.content.data) {
-			const ext = message.content.mimetype.split("/")[1].split(";")[0] || "jpg";
-			const fileName = `group-photo-${Date.now()}-${Math.floor(Math.random() * 1000)}.${ext}`;
-			const mediaDir = path.join(this.dataPath, "media");
-			await fs.mkdir(mediaDir, { recursive: true });
+		if (!mediaData && message.type === "image" && message.content) {
+			let imageData = message.content.data;
+			if (!imageData && typeof message.downloadMedia === "function") {
+				try {
+					const media = await message.downloadMedia();
+					imageData = media?.data;
+				} catch (e) {
+					this.logger.error("Erro ao baixar imagem da mensagem atual:", e);
+				}
+			}
 
-			await fs.writeFile(
-				path.join(mediaDir, fileName),
-				Buffer.from(message.content.data, "base64")
-			);
-			mediaData = fileName;
+			if (imageData) {
+				const ext = message.content.mimetype.split("/")[1].split(";")[0] || "jpg";
+				const fileName = `group-photo-${Date.now()}-${Math.floor(Math.random() * 1000)}.${ext}`;
+				const mediaDir = path.join(this.dataPath, "media");
+				await fs.mkdir(mediaDir, { recursive: true });
+
+				await fs.writeFile(path.join(mediaDir, fileName), Buffer.from(imageData, "base64"));
+				mediaData = fileName;
+			}
 		}
 
 		// Se não há argumentos e não há mídia, remove a configuração de foto
@@ -5792,35 +6106,47 @@ class Management {
 				});
 			}
 
-			if (args.length < 2) {
+			// 1. A mensagem deve possuir mentions.length === 1
+			if (!message.mentions || message.mentions.length !== 1) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: "⚠️ Você precisa mencionar exatamente uma pessoa para definir o apelido."
+				});
+			}
+
+			const mentionJid = message.mentions[0];
+			const mentionUserPart = mentionJid.split("@")[0];
+
+			// Resolve phone number from LID if possible
+			let pnUserPart = mentionUserPart;
+			if (bot.getPnFromLid) {
+				const resolvedPn = bot.getPnFromLid(mentionUserPart, message.origin?.groupData);
+				if (resolvedPn) {
+					pnUserPart = resolvedPn.split("@")[0];
+				}
+			}
+
+			// 2. Parse na string para remover o mention da mensagem e pegar a string de texto restante
+			let nickname = args.join(" ");
+			nickname = nickname.replace("@" + mentionUserPart, "");
+			if (pnUserPart !== mentionUserPart) {
+				nickname = nickname.replace("@" + pnUserPart, "");
+			}
+			nickname = nickname.trim();
+
+			if (!nickname) {
 				return new ReturnMessage({
 					chatId: group.id,
 					content:
-						"Por favor, forneça o número do usuário e o apelido. Exemplo: !g-setApelido 5511999999999 Novo Apelido"
+						"⚠️ Por favor, forneça o apelido para a pessoa mencionada. Exemplo:\n!g-setApelido Apelido @pessoa\nou\n!g-setApelido @pessoa Apelido"
 				});
 			}
-
-			// Processa o número do usuário
-			let userNumber = args[0].replace(/\D/g, ""); // Remove não-dígitos
-
-			// Verifica se o número tem pelo menos 8 dígitos
-			if (userNumber.length < 8) {
-				return new ReturnMessage({
-					chatId: group.id,
-					content: "O número deve ter pelo menos 8 dígitos."
-				});
-			}
-
-			if (bot.getPnFromLid) {
-				userNumber = bot.getPnFromLid(userNumber, message.origin.groupData);
-				userNumber = userNumber.split("@")[0];
-			}
-
-			// Obtém o apelido a partir do resto dos argumentos
-			const nickname = args.slice(1).join(" ");
 
 			// Limita o apelido a 20 caracteres
 			const trimmedNickname = nickname.length > 20 ? nickname.substring(0, 20) : nickname;
+
+			// A chave numero em group.nicks é o número de telefone (sem JID)
+			const userNumber = pnUserPart;
 
 			// Inicializa o array de apelidos se não existir
 			if (!group.nicks) {
@@ -5844,16 +6170,12 @@ class Management {
 			// Salva o grupo atualizado
 			await this.database.saveGroup(group);
 
-			// Tenta obter o nome do contato
+			// Tenta obter o nome do contato do target
 			let contactName = "usuário";
 			try {
-				const contact = await bot.client.getContactById(message.authorAlt ?? message.author);
+				const contact = await bot.client.getContactById(mentionJid);
 				this.logger.debug(`[setNickAdmin] `, { contact });
-				contactName =
-					contact.name?.pushName ??
-					contact.pushname ??
-					contact.name ??
-					userNumber.replace("@c.us", "");
+				contactName = contact.name?.pushName ?? contact.pushname ?? contact.name ?? userNumber;
 			} catch (contactError) {
 				this.logger.debug(
 					`Não foi possível obter informações do contato ${userNumber}:`,
@@ -5943,7 +6265,50 @@ class Management {
 		return this.toggleStreamMentions(bot, message, args, group, "youtube");
 	}
 
-	async generatePainelCommand(bot, message, args, group) {
+	async generatePainelCommand(bot, message, args, group, privateManagement) {
+		let targetGroup = group;
+
+		// Se veio no PV, não há grupo ativo ou o usuário quer acessar outro grupo diretamente por g-painel nomegrupo
+		if (!message.group && args.length > 0) {
+			const groupName = args[0].trim().toLowerCase();
+			const groups = await this.database.getGroups();
+			targetGroup = groups.find((g) => g.name.trim().toLowerCase() === groupName);
+
+			if (targetGroup) {
+				const isUserAdminInTarget = await this.adminUtils.isAdmin(
+					message.author,
+					targetGroup,
+					false,
+					bot
+				);
+				if (isUserAdminInTarget) {
+					if (privateManagement) {
+						privateManagement[message.author] = targetGroup.id;
+					}
+				} else {
+					return new ReturnMessage({
+						chatId: message.author,
+						content: `Você *NÃO É* administrador do grupo '${targetGroup.name}'.`,
+						reaction: "🙅‍♂️"
+					});
+				}
+			} else {
+				return new ReturnMessage({
+					chatId: message.author,
+					content: `Grupo não encontrado: ${groupName}`,
+					reaction: "🙅‍♂️"
+				});
+			}
+		}
+
+		if (!targetGroup) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content:
+					"Você precisa especificar um grupo ou estar em um grupo gerenciado. Exemplo: !g-painel [nomeDoGrupo]"
+			});
+		}
+
 		// Generate token
 		const token = this.generateRandomToken(32);
 		const now = new Date();
@@ -5964,8 +6329,8 @@ class Management {
 			token,
 			requestNumber: message.author,
 			authorName: message.authorName ?? "Unknown",
-			groupName: group.name,
-			groupId: group.id,
+			groupName: targetGroup.name,
+			groupId: targetGroup.id,
 			botId: bot.id,
 			createdAt: now.toISOString(),
 			expiresAt: expiration.toISOString()
@@ -6444,6 +6809,345 @@ class Management {
 				content: "❌ Erro ao buscar histórico de dossiês."
 			});
 		}
+	}
+
+	/**
+	 * Copia comandos personalizados de um grupo para outro
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async copyCommands(bot, message, args, group) {
+		if (!group) {
+			return new ReturnMessage({
+				chatId: message.author,
+				content: "Este comando só pode ser usado em grupos."
+			});
+		}
+
+		if (args.length < 2) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content:
+					"⚠️ *Uso incorreto.* Como usar:\n\n*!g-copiarCmds <grupoOrigem> <grupoDestino>*\n\nExemplo: !g-copiarCmds grupoA grupoB"
+			});
+		}
+
+		const fromGroupName = args[0].trim();
+		const toGroupName = args[1].trim();
+
+		try {
+			// Busca os grupos
+			const groups = await this.database.getGroups();
+			const fromGroup = groups.find(
+				(g) => g.name.trim().toLowerCase() === fromGroupName.toLowerCase() || g.id === fromGroupName
+			);
+			const toGroup = groups.find(
+				(g) => g.name.trim().toLowerCase() === toGroupName.toLowerCase() || g.id === toGroupName
+			);
+
+			if (!fromGroup) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `❌ Grupo de origem '${fromGroupName}' não foi encontrado.`
+				});
+			}
+
+			if (!toGroup) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `❌ Grupo de destino '${toGroupName}' não foi encontrado.`
+				});
+			}
+
+			if (fromGroup.id === toGroup.id) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `⚠️ O grupo de origem e o de destino são o mesmo grupo (${fromGroup.name}).`
+				});
+			}
+
+			// Verifica se o remetente é administrador nos 2 grupos
+			const isAdminInFrom = await this.adminUtils.isAdmin(message.author, fromGroup, null, bot);
+			if (!isAdminInFrom) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `❌ Você não é administrador no grupo de origem '${fromGroup.name}'.`
+				});
+			}
+
+			const isAdminInTo = await this.adminUtils.isAdmin(message.author, toGroup, null, bot);
+			if (!isAdminInTo) {
+				return new ReturnMessage({
+					chatId: group.id,
+					content: `❌ Você não é administrador no grupo de destino '${toGroup.name}'.`
+				});
+			}
+
+			// Carrega os comandos de ambos os grupos
+			const fromCmds = await this.database.getCustomCommands(fromGroup.id);
+			const toCmds = await this.database.getCustomCommands(toGroup.id);
+
+			const originActiveCmds = fromCmds.filter((cmd) => !cmd.deleted);
+			const destMap = new Map(toCmds.map((cmd) => [cmd.startsWith.toLowerCase(), cmd]));
+
+			const newCmdsList = [];
+			const updatedCmdsList = [];
+			let copiedCount = 0;
+			let overwrittenCount = 0;
+
+			const isDifferent = (cmdA, cmdB) => {
+				if (cmdA.active !== cmdB.active) return true;
+				if (cmdA.adminOnly !== cmdB.adminOnly) return true;
+				if (cmdA.cooldown !== cmdB.cooldown) return true;
+				if (cmdA.react !== cmdB.react) return true;
+				if (cmdA.reply !== cmdB.reply) return true;
+				if (cmdA.sendAllResponses !== cmdB.sendAllResponses) return true;
+				if (cmdA.ignoreInteract !== cmdB.ignoreInteract) return true;
+
+				// Compara respostas
+				const respA = cmdA.responses || [];
+				const respB = cmdB.responses || [];
+				if (respA.length !== respB.length) return true;
+				for (let i = 0; i < respA.length; i++) {
+					if (respA[i] !== respB[i]) return true;
+				}
+
+				// Compara menções
+				const mentA = cmdA.mentions || [];
+				const mentB = cmdB.mentions || [];
+				if (mentA.length !== mentB.length) return true;
+				for (let i = 0; i < mentA.length; i++) {
+					if (mentA[i] !== mentB[i]) return true;
+				}
+
+				return false;
+			};
+
+			for (const origCmd of originActiveCmds) {
+				const trigger = origCmd.startsWith.toLowerCase();
+				const destCmd = destMap.get(trigger);
+
+				if (!destCmd || destCmd.deleted) {
+					// Não existe no destino, ou existia e foi deletado
+					const newCmd = {
+						...origCmd,
+						groupId: toGroup.id,
+						metadata: {
+							createdBy: message.author,
+							createdAt: Date.now()
+						}
+					};
+					await this.database.saveCustomCommand(toGroup.id, newCmd);
+					newCmdsList.push(origCmd.startsWith);
+					copiedCount++;
+				} else if (isDifferent(origCmd, destCmd)) {
+					// Existe mas é diferente
+					const updatedCmd = {
+						...origCmd,
+						groupId: toGroup.id,
+						metadata: {
+							createdBy:
+								destCmd.metadata?.createdBy || origCmd.metadata?.createdBy || message.author,
+							createdAt: destCmd.metadata?.createdAt || origCmd.metadata?.createdAt || Date.now(),
+							updatedBy: message.author,
+							updatedAt: Date.now()
+						}
+					};
+					await this.database.saveCustomCommand(toGroup.id, updatedCmd);
+					updatedCmdsList.push(origCmd.startsWith);
+					overwrittenCount++;
+				}
+			}
+
+			if (copiedCount > 0 || overwrittenCount > 0) {
+				this.database.clearCache(`commands:${toGroup.id}`);
+				await bot.eventHandler.commandHandler.loadCustomCommandsForGroup(toGroup.id);
+			}
+
+			const prefix = toGroup.prefix ?? "!";
+			let responseContent = `*Sincronização de comandos concluída com sucesso! (Estilo rsync)*\n\n`;
+			responseContent += `• Origem: *${fromGroup.name}*\n`;
+			responseContent += `• Destino: *${toGroup.name}*\n\n`;
+
+			if (copiedCount > 0) {
+				responseContent += `*Novos comandos copiados (${copiedCount}):*\n`;
+				responseContent += newCmdsList.map((cmd) => `  - ${prefix}${cmd}`).join("\n") + `\n\n`;
+			}
+
+			if (overwrittenCount > 0) {
+				responseContent += `*Comandos atualizados (${overwrittenCount}):*\n`;
+				responseContent += updatedCmdsList.map((cmd) => `  - ${prefix}${cmd}`).join("\n") + `\n\n`;
+			}
+
+			if (copiedCount === 0 && overwrittenCount === 0) {
+				responseContent += `✅ Todos os comandos do grupo destino já estão idênticos aos do grupo de origem (nada a fazer).`;
+			} else {
+				responseContent += `✨ Total analisado: ${originActiveCmds.length} comandos.`;
+			}
+
+			return new ReturnMessage({
+				chatId: group.id,
+				content: responseContent
+			});
+		} catch (error) {
+			this.logger.error("Erro ao copiar comandos entre grupos:", error);
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "❌ Erro inesperado ao sincronizar os comandos."
+			});
+		}
+	}
+
+	/**
+	 * Remove membros mencionados do grupo
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async banUser(bot, message, args, group) {
+		if (!group || !bot.privado) return null;
+
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "⚠️ O bot precisa ser administrador do grupo para remover membros."
+			});
+		}
+
+		const mentions = message.mentions ?? [];
+		if (mentions.length === 0) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "⚠️ Por favor, mencione pelo menos uma pessoa para remover."
+			});
+		}
+
+		// Remove cada pessoa mencionada
+		const removed = [];
+		const failed = [];
+		for (const target of mentions) {
+			try {
+				await bot.removeFromGroup(group.id, [target]);
+				removed.push(target.split("@")[0]);
+			} catch (err) {
+				this.logger.error(`Erro ao banir usuário ${target} do grupo ${group.id}:`, err);
+				failed.push(target.split("@")[0]);
+			}
+		}
+
+		let response = "";
+		if (removed.length > 0) {
+			response += `✅ Removido(s) do grupo: @${removed.join(", @")}\n`;
+		}
+		if (failed.length > 0) {
+			response += `❌ Falha ao remover: @${failed.join(", @")}\n`;
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: response.trim(),
+			options: {
+				mentions
+			}
+		});
+	}
+
+	/**
+	 * Remove membros mencionados do grupo e os bloqueia no banco de dados
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @param {Object} group - Dados do grupo
+	 * @returns {Promise<ReturnMessage>} Mensagem de retorno
+	 */
+	async blockGroupUser(bot, message, args, group) {
+		if (!group || !bot.privado) return null;
+
+		const isAdmin = await this.isBotAdmin(bot, group);
+		if (!isAdmin) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "⚠️ O bot precisa ser administrador do grupo para remover e bloquear membros."
+			});
+		}
+
+		const mentions = message.mentions ?? [];
+		if (mentions.length === 0) {
+			return new ReturnMessage({
+				chatId: group.id,
+				content: "⚠️ Por favor, mencione pelo menos uma pessoa para bloquear."
+			});
+		}
+
+		// Garante que o array filters.people está inicializado
+		if (!group.filters) {
+			group.filters = {};
+		}
+		if (!group.filters.people || !Array.isArray(group.filters.people)) {
+			group.filters.people = [];
+		}
+
+		const removed = [];
+		const failed = [];
+
+		for (const target of mentions) {
+			try {
+				// Resolve o contato para obter o número e o LID correto
+				let pn = target.split("@")[0];
+				let lid = null;
+				try {
+					const contact = await bot.client.getContactById(target);
+					if (contact) {
+						pn = contact.id._serialized.split("@")[0];
+						if (contact.lid) {
+							lid = contact.lid.split("@")[0];
+						}
+					}
+				} catch (e) {
+					this.logger.error(`Erro ao obter contato para obter LID de ${target}:`, e.message);
+				}
+
+				// Adiciona ao banco de dados (group.filters.people)
+				if (!group.filters.people.includes(pn)) {
+					group.filters.people.push(pn);
+				}
+				if (lid && !group.filters.people.includes(lid) && lid !== pn) {
+					group.filters.people.push(lid);
+				}
+
+				// Remove a pessoa do grupo
+				await bot.removeFromGroup(group.id, [target]);
+				removed.push(pn);
+			} catch (err) {
+				this.logger.error(`Erro ao bloquear/remover usuário ${target} do grupo ${group.id}:`, err);
+				failed.push(target.split("@")[0]);
+			}
+		}
+
+		// Salva o grupo atualizado
+		await this.database.saveGroup(group);
+
+		let response = "";
+		if (removed.length > 0) {
+			response += `🔒 Removido(s) e bloqueado(s) do grupo: @${removed.join(", @")}\n`;
+		}
+		if (failed.length > 0) {
+			response += `❌ Falha ao remover/bloquear: @${failed.join(", @")}\n`;
+		}
+
+		return new ReturnMessage({
+			chatId: group.id,
+			content: response.trim(),
+			options: {
+				mentions
+			}
+		});
 	}
 }
 

@@ -1,5 +1,14 @@
-.PHONY: help setup generate-secrets up down logs restart build pull ps update-allm update-whatsgoapi
+.PHONY: help setup generate-secrets up down logs restart build pull ps update-allm update-ytdl update-whatsgoapi logs-cobalt recover_sql
 
+# Habilita o Docker BuildKit por padrão para builds mais rápidas
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+
+# Suporte para argumentos posicionais no comando make recover_sql
+ifeq ($(firstword $(MAKECMDGOALS)),recover_sql)
+  RUN_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+  $(eval $(RUN_ARGS):;@:)
+endif
 
 # Cores usando escape codes literais para garantir compatibilidade
 GREEN  := $(shell printf '\033[0;32m')
@@ -58,18 +67,23 @@ generate-secrets: ## Gera o .env a partir do .env.example com segredos e inputs 
 ##@ Docker
 
 up: ## Inicia todos os serviços em modo background
+	@mkdir -p data && echo "Iniciando todos os serviços..." > data/status_motivo.txt
 	docker compose up -d
 
 up-build: ## Constrói as imagens e inicia todos os serviços
+	@mkdir -p data && echo "Construindo imagens e iniciando os serviços..." > data/status_motivo.txt
 	docker compose up -d --build
 
 down: ## Para todos os serviços
+	@mkdir -p data && echo "Serviços desligados pelo administrador." > data/status_motivo.txt
 	docker compose down
 
 restart: ## Reinicia todos os serviços
+	@mkdir -p data && echo "Reiniciando todos os serviços..." > data/status_motivo.txt
 	docker compose restart
 
 restart-bot: ## Reinicia apenas o bot ravena-ai
+	@mkdir -p data && echo "Reiniciando o contêiner do bot..." > data/status_motivo.txt
 	docker compose restart ravena-ai
 
 restart-api: ## Reinicia apenas o whatsgoapi
@@ -87,10 +101,13 @@ restart-rembg: ## Reinicia apenas o serviço rembg
 restart-health: ## Reinicia apenas o monitor de saúde
 	docker compose restart health-check
 
-ravena-ai: ## Faz lint, build e recarrega o código do bot ravena-ai
-	npm run lint:fix && docker compose up -d --build ravena-ai
+ravena-ai: ## Faz build e recarrega o código do bot ravena-ai
+	@mkdir -p data && echo "Atualizando código e reiniciando o bot..." > data/status_motivo.txt
+	docker compose build ravena-ai
+	docker compose up -d ravena-ai
 
 build: ## Constrói todas as imagens Docker
+	@mkdir -p data && echo "Reconstruindo imagens Docker..." > data/status_motivo.txt
 	docker compose build
 
 pull: ## Baixa as imagens base mais recentes
@@ -101,6 +118,9 @@ logs: ## Exibe os logs de todos os serviços
 
 logs-bot: ## Exibe os logs do bot ravena-ai
 	docker compose logs -f --tail 100 ravena-ai
+
+logs-cobalt: ## Exibe e une os logs do container cobalt e logs relacionados no bot ravena-ai
+	docker compose logs -f --tail 100 cobalt ravena-ai | grep --line-buffered -i cobalt
 
 logs-api: ## Exibe os logs do whatsgoapi
 	docker compose logs -f --tail 100 whatsgoapi
@@ -123,6 +143,12 @@ ps: ## Mostra o status de todos os containers
 update-allm: ## Atualiza a documentação de comandos para o AnythingLLM no container
 	docker compose exec ravena-ai node update-allm-cmds.js
 
+update-ytdl: ## Atualiza o yt-dlp para nightly dentro do container ravena-ai
+	docker compose exec ravena-ai bash update-ytdl.sh
+
+update-donates: ## Atualiza o ranking de doadores no README.md
+	@./update-donates.sh
+
 test: ## Roda o arquivo run-testes.js dentro do container (sem WhatsApp)
 	docker cp run-testes.js $$(docker compose ps -q ravena-ai):/app/run-testes.js
 	docker cp src/testing $$(docker compose ps -q ravena-ai):/app/src/
@@ -133,6 +159,14 @@ test-quick: ## Copia um arquivo alterado e roda os testes (uso: make test-quick 
 	docker cp $(FILE) $$(docker compose ps -q ravena-ai):/app/$(FILE)
 	docker compose exec ravena-ai node run-testes.js
 
+test-providers: ## Testa todos os provedores de IA do service-providers.json
+	@node test-providers.js
+
+regenerate-rarefish: ## Regenera imagens de capturas raras perdidas ou placeholders
+	docker compose exec ravena-ai node regenerate-rarefish.js
+
+sync: ## Sincroniza arquivos modificados com o container ravena-ai
+	@./sync-to-docker.sh
 
 update-whatsgoapi: ## Sincroniza o submódulo whatsgoapi e reconstrói o container
 	@printf "$(CYAN)Sincronizando submódulo whatsgoapi...$(NC)\n"
@@ -161,3 +195,9 @@ clean-all: ## PERIGO: Remove TODOS os containers, imagens e volumes (perda de da
 
 validate: ## Valida a sintaxe do arquivo docker-compose.yml
 	@docker compose config --quiet && printf "$(GREEN)✅ docker-compose.yml é válido$(NC)\n" || printf "$(YELLOW)❌ docker-compose.yml inválido$(NC)\n"
+
+recover_sql: ## Recupera banco SQLite corrompido (Uso: make recover_sql <banco.db> ou make recover_sql DB=<banco.db>)
+	@DB_PATH="$(RUN_ARGS)"; \
+	if [ -z "$$DB_PATH" ]; then DB_PATH="$(DB)"; fi; \
+	if [ -z "$$DB_PATH" ]; then printf "$(YELLOW)Uso: make recover_sql <caminho/do/banco.db> ou make recover_sql DB=<caminho/do/banco.db>$(NC)\n"; exit 1; fi; \
+	./recover-sqlite.sh "$$DB_PATH"

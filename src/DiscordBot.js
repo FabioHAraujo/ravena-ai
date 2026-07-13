@@ -1,8 +1,9 @@
 /*
   90% VIBE CODED!!! Apenas pela zuera, tem muita coisa que não faz sentido algum
 */
-const { AttachmentBuilder, PermissionsBitField } = require("discord.js");
+const { AttachmentBuilder, PermissionsBitField, MessageFlags } = require("discord.js");
 const axios = require("axios");
+const mime = require("mime-types");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -21,6 +22,7 @@ const StreamSystem = require("./StreamSystem");
 const Database = require("./utils/Database");
 const LoadReport = require("./LoadReport");
 const Logger = require("./utils/Logger");
+const SkipGroups = require("./utils/SkipGroups");
 
 // Utils
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -46,8 +48,13 @@ class DiscordBot {
 		this.discordClient = this.apiClient.getClient();
 
 		// Opções existentes adaptadas
+		this.nomeExibir = options.nomeExibir;
+		this.sendJoinInfo = options.sendJoinInfo;
+		this.phoneNumber = null; // Will be set when ready
 		this.pvAI = options.pvAI !== undefined ? options.pvAI : true;
 		this.ignorePV = options.ignorePV || false;
+		this.updateStatus = options.updateStatus ?? true;
+		this.aiPersonality = options.aiPersonality ?? "";
 		this.grupoLogs = options.grupoLogs; // Espera-se um Channel ID
 		this.grupoAvisos = options.grupoAvisos; // Espera-se um Channel ID
 		this.notificarDonate = options.notificarDonate;
@@ -59,14 +66,17 @@ class DiscordBot {
 
 		// --- Caches e Handlers (mantidos para compatibilidade) ---
 		this.redisURL = options.redisURL;
-		this.redisDB = options.redisDB || 1; // Usar um DB diferente do Whatsgo para evitar conflitos
-		this.redisTTL = options.redisTTL || 604800;
-		this.maxCacheSize = 3000;
+		this.redisDB = options.redisDB ?? 1; // Usar um DB diferente do Whatsgo para evitar conflitos
+		this.redisTTL = options.redisTTL ?? 604800;
+		this.maxCacheSize = 1000;
+
+		this.skipGroupInfo = [];
+		this.streamIgnoreGroups = [];
 
 		this.messageCache = [];
 		this.contactCache = [];
 		this.sentMessagesCache = [];
-		this.cacheManager = new CacheManager(
+		this.cacheManager = CacheManager.getInstance(
 			this.redisURL,
 			this.redisDB,
 			this.redisTTL,
@@ -91,7 +101,14 @@ class DiscordBot {
 
 		// --- Placeholders para sistemas não aplicáveis ---
 		this.inviteSystem = new InviteSystem(this); // Pode ser adaptado no futuro
-		this.streamSystem = null; // new StreamSystem(this);
+
+		if (process.env.DISABLE_ACTIVITY !== "true") {
+			this.streamSystem = StreamSystem.getInstance();
+			this.streamSystem.registerBot(this);
+			this.streamSystem.initialize();
+		} else {
+			this.streamSystem = null;
+		}
 
 		// --- Client Fake para manter a compatibilidade ---
 		this.client = {
@@ -118,28 +135,32 @@ class DiscordBot {
 		this.logger.info(`[${this.id}] Initializing Discord bot...`);
 		this.database.registerBotInstance(this);
 		this.startupTime = Date.now();
+		this.lastMessageReceived = Date.now();
+
+		await this._loadSkipGroupInfo();
 
 		this.logger.info("Registering Discord event listeners...");
 
 		this.discordClient.on("ready", () => {
-			this.isConnected = true;
 			this.discordBotId = this.discordClient.user.id;
-
+			this.phoneNumber = this.discordBotId;
+			// Update fake client info now that we have the real user id
+			this.client.info.wid._serialized = this.discordBotId;
 			this.logger.info(
 				`>>> SUCESSO! Bot ${this.id} (${this.discordClient.user.tag}) está conectado ao Discord! (ID: ${this.discordBotId}) <<<`
 			);
-			if (this.eventHandler && typeof this.eventHandler.onConnected === "function") {
-				this.eventHandler.onConnected(this);
-			}
+			this._onInstanceConnected();
 			this._sendStartupNotifications();
 		});
 
 		this.discordClient.on("messageCreate", this._handleMessage.bind(this));
 		this.discordClient.on("guildCreate", this._handleGroupJoin.bind(this));
+		this.discordClient.on("guildDelete", this._handleGroupLeave.bind(this));
 		this.discordClient.on("guildMemberAdd", this._handleParticipantUpdate.bind(this));
 
 		this.discordClient.on("error", (error) => {
 			this.logger.error("!!! ERRO DO CLIENTE DISCORD !!!", error);
+			this._onInstanceDisconnected("CLIENT_ERROR");
 		});
 		this.discordClient.on("warn", (warning) => {
 			this.logger.warn("!!! AVISO DO CLIENTE DISCORD !!!", warning);
@@ -149,10 +170,28 @@ class DiscordBot {
 			await this.apiClient.connect();
 		} catch (error) {
 			this.logger.error(`Error during Discord login for instance ${this.id}:`, error);
-			this.isConnected = false;
+			this._onInstanceDisconnected("LOGIN_FAILED");
 		}
 
 		return this;
+	}
+
+	_onInstanceConnected() {
+		if (this.isConnected) return;
+		this.isConnected = true;
+		this.logger.info(`[${this.id}] Successfully connected to Discord.`);
+		if (this.eventHandler && typeof this.eventHandler.onConnected === "function") {
+			this.eventHandler.onConnected(this);
+		}
+	}
+
+	_onInstanceDisconnected(reason = "Unknown") {
+		if (!this.isConnected) return;
+		this.isConnected = false;
+		this.logger.info(`[${this.id}] Disconnected from Discord. Reason: ${reason}`);
+		if (this.eventHandler && typeof this.eventHandler.onDisconnected === "function") {
+			this.eventHandler.onDisconnected(this, reason);
+		}
 	}
 
 	async _handleMessage(message) {
@@ -187,18 +226,54 @@ class DiscordBot {
 		// Simula o evento de entrada em grupo
 		if (this.eventHandler && typeof this.eventHandler.onGroupJoin === "function") {
 			const mockGroupNotification = {
-				id: {
-					server: "g.us", // sufixo de grupo
-					user: guild.ownerId,
-					_serialized: `${guild.id}@g.us`
+				group: {
+					id: guild.id,
+					name: guild.name,
+					isBotJoining: true
 				},
-				body: `Bot foi adicionado ao servidor ${guild.name}`,
-				type: "add",
-				author: guild.ownerId, // Quem adicionou? Não temos essa info, usamos o dono.
-				chatId: guild.id,
-				recipientIds: [this.discordClient.user.id]
+				user: {
+					id: this.discordClient.user.id,
+					name: this.discordClient.user.username
+				},
+				responsavel: {
+					id: guild.ownerId,
+					name: "Guild Owner"
+				},
+				origin: {
+					getChat: async () => ({
+						id: guild.id,
+						name: guild.name,
+						isGroup: true,
+						participants: [],
+						groupMetadata: { desc: guild.description || "" }
+					})
+				}
 			};
 			this.eventHandler.onGroupJoin(this, mockGroupNotification);
+		}
+	}
+
+	async _handleGroupLeave(guild) {
+		this.logger.debug(`_handleGroupLeave`, guild);
+		this.logger.info(`Bot saiu ou foi removido do servidor: ${guild.name} (${guild.id})`);
+		// Simula o evento de saída do grupo
+		if (this.eventHandler && typeof this.eventHandler.onGroupLeave === "function") {
+			const mockGroupNotification = {
+				group: {
+					id: guild.id,
+					name: guild.name,
+					notInGroup: true
+				},
+				user: {
+					id: this.discordClient.user.id,
+					name: this.discordClient.user.username
+				},
+				responsavel: {
+					id: "unknown",
+					name: "Unknown"
+				}
+			};
+			this.eventHandler.onGroupLeave(this, mockGroupNotification);
 		}
 	}
 
@@ -233,7 +308,7 @@ class DiscordBot {
 			const isGroup = message.inGuild();
 			const authorId = message.author.id;
 			const channelId = message.channel.id;
-			const guildId = message.guild.id;
+			const guildId = isGroup ? message.guild.id : null; // null in DMs
 			const timestamp = Math.floor(message.createdTimestamp / 1000);
 			const responseTime = Math.max(0, this.getCurrentTimestamp() - timestamp);
 
@@ -313,7 +388,16 @@ class DiscordBot {
 				id: { _serialized: message.id },
 				author: authorId,
 				from: channelId,
-				react: (emoji) => message.react(emoji),
+				react: async (emoji) => {
+					try {
+						for (const r of message.reactions.cache.values()) {
+							if (r.me) {
+								await r.users.remove(this.discordClient.user.id).catch(() => {});
+							}
+						}
+					} catch (_) {}
+					return message.react(emoji);
+				},
 				getContact: formattedMessage.getContact,
 				getChat: formattedMessage.getChat,
 				getQuotedMessage: async () => {
@@ -340,11 +424,100 @@ class DiscordBot {
 		}
 	}
 
+	_storePublicAttachment(buffer, filename) {
+		try {
+			const outputDir = path.join(__dirname, "..", "public", "attachments");
+			if (!fs.existsSync(outputDir)) {
+				fs.mkdirSync(outputDir, { recursive: true });
+			}
+
+			const tempId = randomBytes(4).toString("hex");
+			const ext = path.extname(filename) || ".bin";
+			const baseName = path.basename(filename, ext);
+			const outputFileName = `att_${baseName}_${tempId}${ext}`;
+			const outputFilePath = path.join(outputDir, outputFileName);
+
+			fs.writeFileSync(outputFilePath, buffer);
+
+			// Agenda a remoção do arquivo após 30 minutos
+			setTimeout(
+				(ofp) => {
+					if (fs.existsSync(ofp)) {
+						fs.unlinkSync(ofp);
+					}
+				},
+				30 * 60 * 1000,
+				outputFilePath
+			);
+
+			const domain = process.env.BOT_DOMAIN || "http://localhost:5000";
+			return `${domain}/attachments/${outputFileName}`;
+		} catch (error) {
+			this.logger.error("[_storePublicAttachment] Erro ao salvar anexo público:", error);
+			return null;
+		}
+	}
+
 	async sendMessage(chatId, content, options = {}) {
 		this.logger.debug(`[sendMessage] to ${chatId} (Type: ${typeof content})`, options);
 		try {
-			const isGroup = !!(await this.discordClient.channels.fetch(chatId)).guild;
+			if (!this.isConnected) {
+				throw new Error("Not connected to Discord");
+			}
+
+			let channel;
+			try {
+				channel = await this.discordClient.channels.fetch(chatId);
+			} catch (fetchError) {
+				// Se falhar ao buscar canal, tenta como User ID para abrir DM
+				try {
+					const user = await this.discordClient.users.fetch(chatId);
+					if (user) {
+						channel = await user.createDM();
+					} else {
+						throw fetchError;
+					}
+				} catch (userError) {
+					this.logger.error(
+						`[sendMessage] Não foi possível encontrar canal ou usuário para ${chatId}`
+					);
+					throw fetchError;
+				}
+			}
+
+			if (!channel || !channel.isTextBased()) {
+				throw new Error(`Channel ${chatId} not found or is not a text channel.`);
+			}
+
+			const isGroup = !!channel.guild;
 			this.loadReport.trackSentMessage(isGroup);
+
+			// Verificar permissões se for em um servidor (Guild)
+			if (isGroup) {
+				const permissions = channel.permissionsFor(this.discordClient.user);
+				if (permissions) {
+					if (!permissions.has(PermissionsBitField.Flags.SendMessages)) {
+						throw new Error(`Bot sem permissão SEND_MESSAGES no canal ${channel.name} (${chatId})`);
+					}
+					// Se for enviar mídia, checar ATTACH_FILES
+					const isMedia =
+						content.isMessageMedia || (content.mimetype && (content.data || content.url));
+					if (isMedia && !permissions.has(PermissionsBitField.Flags.AttachFiles)) {
+						throw new Error(`Bot sem permissão ATTACH_FILES no canal ${channel.name} (${chatId})`);
+					}
+					// Se for uma resposta (quotedMsgId), precisa de READ_MESSAGE_HISTORY
+					if (
+						options.quotedMsgId &&
+						!permissions.has(PermissionsBitField.Flags.ReadMessageHistory)
+					) {
+						this.logger.warn(
+							`Bot sem permissão READ_MESSAGE_HISTORY no canal ${channel.name} (${chatId}). A resposta pode falhar ou ser enviada sem citação.`
+						);
+						// Não vou dar throw aqui para tentar enviar mesmo assim,
+						// mas o Discord pode rejeitar se o payload tiver 'reply'
+					}
+				}
+			}
 
 			if (this.safeMode) {
 				this.logger.info(
@@ -357,16 +530,9 @@ class DiscordBot {
 				};
 			}
 
-			if (!this.isConnected) {
-				throw new Error("Not connected to Discord");
-			}
-
-			const channel = await this.discordClient.channels.fetch(chatId);
-			if (!channel || !channel.isTextBased()) {
-				throw new Error(`Channel ${chatId} not found or is not a text channel.`);
-			}
-
-			const discordPayload = {};
+			const discordPayload = {
+				flags: [MessageFlags.SuppressEmbeds]
+			};
 
 			// --- Tratamento de Conteúdo ---
 			if (typeof content === "string") {
@@ -382,12 +548,31 @@ class DiscordBot {
 					throw new Error("Media content must have 'data' (base64) or 'url'.");
 				}
 
-				const attachment = new AttachmentBuilder(fileBuffer, {
-					name: content.filename || "file.dat"
-				});
-				discordPayload.files = [attachment];
-				if (options.caption) {
-					discordPayload.content = options.caption;
+				const filename = content.filename || "file.dat";
+				const fileSizeMB = fileBuffer.length / (1024 * 1024);
+
+				// Discord limit for bots is usually 25MB. Using 24MB as safe threshold.
+				if (fileSizeMB > 24) {
+					this.logger.warn(
+						`[sendMessage] Arquivo muito grande (${fileSizeMB.toFixed(2)}MB). Gerando link de fallback.`
+					);
+					const publicUrl = this._storePublicAttachment(fileBuffer, filename);
+
+					if (publicUrl) {
+						let fallbackText = `⚠️ **O arquivo é muito grande para o Discord (${fileSizeMB.toFixed(2)}MB)**\n`;
+						if (options.caption) fallbackText += `\n${options.caption}\n`;
+						fallbackText += `\n🔗 **Link para baixar:** ${publicUrl}\n_(O link expira em 30 minutos)_`;
+
+						discordPayload.content = fallbackText;
+					} else {
+						discordPayload.content = `❌ Erro ao processar arquivo grande (${fileSizeMB.toFixed(2)}MB).`;
+					}
+				} else {
+					const attachment = new AttachmentBuilder(fileBuffer, { name: filename });
+					discordPayload.files = [attachment];
+					if (options.caption) {
+						discordPayload.content = options.caption;
+					}
 				}
 			} else if (content.isLocation) {
 				discordPayload.content = `📍 **Localização**: ${content.description || ""}
@@ -398,9 +583,30 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 			}
 
 			// --- Tratamento de Opções ---
-			if (options.mentions && options.mentions.length > 0) {
-				const mentionStrings = options.mentions.map((id) => `<@${id.split("@")[0]}>`).join(" ");
-				discordPayload.content = `${discordPayload.content || ""} ${mentionStrings}`;
+			// Suppress all pings — Discord mentions are noisy; we show names inline instead.
+			discordPayload.allowed_mentions = { parse: [] };
+
+			if (
+				options.mentions &&
+				options.mentions.length > 0 &&
+				typeof discordPayload.content === "string"
+			) {
+				// Replace @userId occurrences in text with plain "@name" (no ping)
+				for (const id of options.mentions) {
+					const cleanId = id.split("@")[0];
+					// Try to resolve a display name from the Discord client cache
+					let displayName = cleanId;
+					try {
+						const user = this.discordClient.users.cache.get(cleanId);
+						if (user) displayName = user.globalName || user.username || cleanId;
+					} catch (_) {
+						/* ignore */
+					}
+					// Replace any @id or <@id> patterns in the content
+					discordPayload.content = discordPayload.content
+						.replace(new RegExp(`<@!?${cleanId}>`, "g"), `@${displayName}`)
+						.replace(new RegExp(`@${cleanId}\\b`, "g"), `@${displayName}`);
+				}
 			}
 
 			if (options.quotedMsgId) {
@@ -425,7 +631,7 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 		}
 	}
 
-	splitContent(text, maxLength = 4000) {
+	splitContent(text, maxLength = 2000) {
 		const chunks = [];
 		if (!(typeof text === "string" || text instanceof String)) return;
 		let remainingText = text?.trim() ?? ""; // Start with trimmed text
@@ -496,11 +702,11 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 		if (okMessages.length === 0) return [];
 
 		// Use flatMap to process the array
-		const MAX_LENGTH = 4000;
+		const MAX_LENGTH = 2000;
 
 		const validMessages = okMessages.flatMap((msg) => {
-			// If content is short, return the message as-is (in an array)
-			if (msg.content.length <= MAX_LENGTH) {
+			// Only split string content
+			if (typeof msg.content !== "string" || msg.content.length <= MAX_LENGTH) {
 				return [msg];
 			}
 
@@ -522,6 +728,8 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 				const result = await this.sendMessage(message.chatId, message.content, message.options);
 				results.push(result);
 
+				// O bot está reagindo à PRÓPRIA mensagem enviada, isto não é interessante. Deve ser commented out no código.
+				/*
 				if (message.reaction && result && result.id?._serialized) {
 					try {
 						const channel = await this.discordClient.channels.fetch(message.chatId);
@@ -534,6 +742,7 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 						);
 					}
 				}
+				*/
 			} catch (sendError) {
 				this.logger.error(
 					`[sendReturnMessages] Falha enviando ReturnMessages para ${message.chatId}:`,
@@ -550,7 +759,10 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 		if (this.discordClient) {
 			await this.discordClient.destroy();
 		}
-		this.isConnected = false;
+		this._onInstanceDisconnected("DESTROYED");
+		if (this.cacheManager && typeof this.cacheManager.stop === "function") {
+			this.cacheManager.stop();
+		}
 		this.logger.info(`[destroy] Bot do Discord ${this.id} foi desligado.`);
 	}
 
@@ -615,17 +827,28 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 
 	// --- Funções de Mídia (Simuladas) ---
 
-	async createMedia(filePath) {
+	async createMedia(filePath, customMime = false) {
 		const data = await readFileAsync(filePath, { encoding: "base64" });
 		const filename = path.basename(filePath);
-		const mimetype = require("mime-types").lookup(filePath) || "application/octet-stream";
+		const mimetype = customMime || mime.lookup(filePath) || "application/octet-stream";
 		return { mimetype, data, filename, isMessageMedia: true };
 	}
 
 	async createMediaFromURL(url, options = {}) {
 		const filename = path.basename(new URL(url).pathname) || "media_from_url";
-		const mimetype = require("mime-types").lookup(url.split("?")[0]) || "application/octet-stream";
+		const mimetype = mime.lookup(url.split("?")[0]) || "application/octet-stream";
 		return { url, mimetype, filename, isMessageMedia: true };
+	}
+
+	async createMediaFromBase64(base64Data, mimetype, filename) {
+		const extension = mime.extension(mimetype) ?? "bin";
+		return {
+			mimetype,
+			data: base64Data,
+			filename: filename ?? `file.${extension}`,
+			source: "base64",
+			isMessageMedia: true
+		};
 	}
 
 	// --- Funções de Cache (Mantidas) ---
@@ -634,15 +857,57 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 		return this.cacheManager.getMessageFromCache(messageId);
 	}
 
+	// --- SkipGroups (compatibilidade) ---
+
+	async _loadSkipGroupInfo() {
+		try {
+			this.skipGroupInfo = await SkipGroups.getInstance().getSkippedGroups(this.id);
+			this.logger.info(
+				`[SkipGroups] Loaded ${this.skipGroupInfo.length} skipped groups for bot ${this.id}.`
+			);
+		} catch (error) {
+			this.logger.error(`[SkipGroups] Error loading skip groups:`, error);
+			this.skipGroupInfo = [];
+		}
+	}
+
+	async _saveSkipGroupInfo() {
+		// Deprecated: saved incrementally
+	}
+
+	async addSkipGroup(groupId) {
+		if (!this.skipGroupInfo.includes(groupId)) {
+			this.skipGroupInfo.push(groupId);
+			await SkipGroups.getInstance().addSkippedGroup(this.id, groupId);
+			this.logger.info(`[SkipGroups] Added ${groupId} to skip list.`);
+		}
+	}
+
+	async removeSkipGroup(groupId) {
+		const initialLength = this.skipGroupInfo.length;
+		this.skipGroupInfo = this.skipGroupInfo.filter((id) => id !== groupId);
+		if (this.skipGroupInfo.length < initialLength) {
+			await SkipGroups.getInstance().removeSkippedGroup(this.id, groupId);
+			this.logger.info(`[SkipGroups] Removed ${groupId} from skip list.`);
+		}
+	}
+
 	// --- Funções de Notificação (Adaptadas) ---
 
-	async _sendStartupNotifications() {
+	_sendStartupNotifications() {
 		if (this.grupoAvisos) {
 			const msg = new ReturnMessage(
 				this.grupoAvisos,
 				`✅ Bot Discord '${this.id}' conectado e operando!`
 			);
 			this.sendReturnMessages(msg);
+		}
+	}
+
+	logMsgToGrupo(msg, extra = false) {
+		if (this.grupoLogs && msg) {
+			this.logger.info(`[logMsgToGrupo] ${msg}`, extra);
+			this.sendMessage(this.grupoLogs, msg);
 		}
 	}
 
@@ -655,17 +920,20 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 		return Promise.resolve(true);
 	}
 
-	async logout() {
+	logout() {
 		return this._unimplemented("logout");
 	}
-	async deleteInstance() {
+	deleteInstance() {
 		return this._unimplemented("deleteInstance");
 	}
-	async createInstance() {
+	createInstance() {
 		return this._unimplemented("createInstance");
 	}
-	async recreateInstance() {
+	recreateInstance() {
 		return this._unimplemented("recreateInstance");
+	}
+	updateVersions() {
+		return this._unimplemented("updateVersions");
 	}
 
 	async sendReaction(chatId, messageId, emoji) {
@@ -673,7 +941,11 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 			const channel = await this.discordClient.channels.fetch(chatId);
 			const msg = await channel.messages.fetch(messageId);
 
-			this.removeReaction(chatId, messageId, process.env.LOADING_EMOJI);
+			for (const r of msg.reactions.cache.values()) {
+				if (r.me) {
+					await r.users.remove(this.discordClient.user.id).catch(() => {});
+				}
+			}
 
 			await msg.react(emoji);
 
@@ -753,6 +1025,60 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 	}
 	async updateProfilePicture(pic) {
 		return this._unimplemented("updateProfilePicture");
+	}
+	deleteMessageByKey(key) {
+		return this._unimplemented("deleteMessageByKey");
+	}
+
+	// --- Compatibilidade com WhatsAppBotGo ---
+
+	_normalizeId(id) {
+		if (typeof id !== "string" || !id) return "";
+		return id.split("@")[0].split(":")[0];
+	}
+
+	async isUserAdminInGroup(userId, groupId) {
+		return this.adminUtils.isAdmin(userId, { id: groupId }, null, this);
+	}
+
+	notInWhitelist(author) {
+		const cleanAuthor = String(author).replace(/\D/g, "");
+		return !this.whitelist.includes(cleanAuthor);
+	}
+
+	validURL(str) {
+		try {
+			new URL(str);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	getLidFromPn(PN, chat) {
+		const participants = chat?.participants || [];
+		const found = participants.find((p) => {
+			const number = p.id?._serialized || "";
+			return number.startsWith(PN);
+		});
+		return found ? found.id._serialized : PN;
+	}
+
+	getPnFromLid(lid, chat) {
+		const participants = chat?.participants || [];
+		const found = participants.find((p) => p.id?._serialized?.startsWith(lid));
+		return found ? found.id._serialized : lid;
+	}
+
+	async fetchPushNameFromCache(id) {
+		return await this.cacheManager.getPushnameFromCache(id);
+	}
+
+	shouldDiscardMessage() {
+		return false;
+	}
+	rndString() {
+		return (Math.random() + 1).toString(36).substring(7);
 	}
 
 	// --- Funções Utilitárias ---

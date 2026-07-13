@@ -149,6 +149,7 @@ document.addEventListener('DOMContentLoaded', () => {
         cmdSendAll: document.getElementById('cmd-send-all'),
         cmdAdminOnly: document.getElementById('cmd-admin-only'),
         cmdEmoji: document.getElementById('cmd-emoji'),
+        cmdCooldown: document.getElementById('cmd-cooldown'),
         cmdResponsesList: document.getElementById('cmd-responses-list'),
         btnSaveCmd: document.getElementById('btn-save-cmd'),
         btnDeleteCmd: document.getElementById('btn-delete-cmd'),
@@ -156,6 +157,7 @@ document.addEventListener('DOMContentLoaded', () => {
         modalTitle: document.getElementById('modal-title'),
         btnAddTag: document.getElementById('btn-add-tag'),
         cmdTagsList: document.getElementById('cmd-tags-list'),
+        cmdTagsHelper: document.getElementById('cmd-tags-helper'),
 
         // Member Modal
         memberModalTitle: document.getElementById('member-modal-title'),
@@ -311,7 +313,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             groupId = validation.groupId;
             els.userName.textContent = validation.authorName;
-            els.groupName.textContent = validation.groupName;
+            els.groupName.textContent = (validation.groupName || '').trim();
             expiresAt = new Date(validation.expiresAt);
             startTimer();
 
@@ -532,11 +534,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function updateGroupDataFromForm() {
         const nameInput = document.getElementById('group-name-input');
-        const nameValue = nameInput.value;
+        const nameValue = nameInput.value.trim();
+        nameInput.value = nameValue;
         
-        // Validation for group name: alphanumeric, no whitespace, 1-15 chars
-        if (!/^[a-zA-Z0-9]{1,15}$/.test(nameValue)) {
-            throw new Error('O nome do grupo deve ser alfanumérico, sem espaços e ter entre 1 e 15 caracteres.');
+        // Validation for group name: alphanumeric, no whitespace, 1-30 chars, allowing -, _, .
+        if (!/^[a-zA-Z0-9_\-.]{1,30}$/.test(nameValue)) {
+            throw new Error('O nome do grupo deve ser alfanumérico (letras e números), sem espaços, com no máximo 30 caracteres e podendo conter apenas _, - e .');
         }
 
         const prefixInput = document.getElementById('group-prefix');
@@ -556,10 +559,16 @@ document.addEventListener('DOMContentLoaded', () => {
         groupData.filters.nsfw = document.getElementById('delete-nsfw').checked;
 
         groupData.autoStt = document.getElementById('auto-stt').checked;
+        groupData.notificaGrupoFechado = document.getElementById('notifica-grupo-fechado').checked;
+        groupData.notificaGrupoAberto = document.getElementById('notifica-grupo-aberto').checked;
         if(!groupData.interact) groupData.interact = {};
         groupData.interact.enabled = document.getElementById('auto-interaction').checked;
         groupData.interact.chance = parseInt(document.getElementById('interaction-chance').value);
         groupData.interact.cooldown = parseInt(document.getElementById('interaction-cooldown').value);
+        const proporcaoSlider = document.getElementById('interaction-proporcao');
+        if (proporcaoSlider) {
+            groupData.interact.proporcao = parseInt(proporcaoSlider.value);
+        }
         
         const autoTranslate = document.getElementById('auto-translate').checked;
         const translateLang = document.getElementById('translate-lang').value.trim();
@@ -574,7 +583,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function populateFields() {
         document.getElementById('group-id').value = groupData.id;
         document.getElementById('group-created-at').value = new Date(groupData.createdAt).toLocaleDateString();
-        document.getElementById('group-name-input').value = groupData.name || '';
+        document.getElementById('group-name-input').value = (groupData.name || '').trim();
         document.getElementById('group-prefix').value = groupData.prefix || '';
         document.getElementById('bot-enabled').checked = !groupData.paused;
         document.getElementById('bot-personality').value = groupData.customAIPrompt || '';
@@ -623,6 +632,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         document.getElementById('auto-stt').checked = !!groupData.autoStt;
+        document.getElementById('notifica-grupo-fechado').checked = !!groupData.notificaGrupoFechado;
+        document.getElementById('notifica-grupo-aberto').checked = !!groupData.notificaGrupoAberto;
         
         const interact = groupData.interact || {};
         document.getElementById('auto-interaction').checked = !!interact.enabled;
@@ -634,6 +645,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
         document.getElementById('interaction-cooldown').value = interact.cooldown || 5;
         document.getElementById('cooldown-val').textContent = interact.cooldown || 5;
+
+        const proporcaoVal = interact.proporcao !== undefined ? interact.proporcao : 50;
+        const proporcaoSlider = document.getElementById('interaction-proporcao');
+        if (proporcaoSlider) {
+            proporcaoSlider.value = proporcaoVal;
+            document.getElementById('proporcao-val').textContent = proporcaoVal;
+            const iaChance = proporcaoVal;
+            const cmdChance = 100 - iaChance;
+            const descEl = document.getElementById('proporcao-desc');
+            if (descEl) {
+                if (iaChance === 100) {
+                    descEl.innerHTML = "Usando apenas <b>IA</b> para interagir";
+                } else if (iaChance === 0) {
+                    descEl.innerHTML = "Usando apenas <b>comandos</b> para interagir";
+                } else {
+                    descEl.textContent = `${cmdChance}% de chance de usar algum comando, ${iaChance}% de chance de usar IA para interagir`;
+                }
+            }
+        }
 
         toggleInteractionSettings(!!interact.enabled);
 
@@ -1160,6 +1190,7 @@ document.addEventListener('DOMContentLoaded', () => {
             els.cmdSendAll.checked = !!cmd.sendAllResponses;
             els.cmdAdminOnly.checked = !!cmd.adminOnly;
             els.cmdEmoji.value = cmd.react || '';
+            els.cmdCooldown.value = cmd.cooldown || 0;
             currentCmdMentions = cmd.mentions || [];
             
             if (cmd.responses) {
@@ -1175,6 +1206,7 @@ document.addEventListener('DOMContentLoaded', () => {
             els.cmdSendAll.checked = false;
             els.cmdAdminOnly.checked = false;
             els.cmdEmoji.value = '';
+            els.cmdCooldown.value = 0;
             currentCmdMentions = [];
             addResponseInput('text', '');
             els.cmdMetadata.innerHTML = '';
@@ -1413,19 +1445,32 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     els.btnSaveCmd.addEventListener('click', async () => {
-        const trigger = els.cmdTrigger.value.trim().toLowerCase();
+        let trigger = els.cmdTrigger.value.trim().toLowerCase();
         if (!trigger) return await showCustomAlert('O comando precisa de um gatilho');
+
+        const prefix = (groupData.prefix || '!').trim();
+        if (trigger.startsWith(prefix)) {
+            trigger = trigger.substring(prefix.length).trim();
+        } else if (prefix !== '!' && trigger.startsWith('!')) {
+            trigger = trigger.substring(1).trim();
+        }
+
+        if (!trigger) return await showCustomAlert('O comando precisa de um gatilho válido (sem apenas o prefixo)');
 
         const inputs = document.querySelectorAll('.cmd-response-input');
         const responses = Array.from(inputs).map(i => i.value).filter(v => v.trim() !== '');
         
         if (responses.length === 0) return await showCustomAlert('Adicione pelo menos uma resposta');
 
+        const rawCooldown = parseInt(els.cmdCooldown.value);
+        const cooldownValue = isNaN(rawCooldown) || rawCooldown < 0 ? 0 : Math.min(rawCooldown, 60000);
+
         const newCmd = {
             startsWith: trigger, responses: responses, active: els.cmdActive.checked,
             ignoreInteract: !els.cmdInteract.checked, reply: els.cmdReplyQuote.checked,
             sendAllResponses: els.cmdSendAll.checked, adminOnly: els.cmdAdminOnly.checked,
             react: els.cmdEmoji.value.trim() || null,
+            cooldown: cooldownValue,
             mentions: currentCmdMentions,
             count: currentEditingCmd ? currentEditingCmd.count : 0,
             metadata: currentEditingCmd ? currentEditingCmd.metadata : { createdBy: 'Painel Web', createdAt: Date.now() }
@@ -1487,6 +1532,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const tbody = els.memberTableBody;
         tbody.innerHTML = '';
         
+        const actionHeader = document.getElementById('member-action-header');
+        if (actionHeader) {
+            actionHeader.textContent = onMemberSelect ? 'Ação' : 'Apelido';
+        }
+
         const participants = groupData.participants || [];
         const filtered = participants.filter(p => {
             const search = filter.toLowerCase();
@@ -1507,7 +1557,9 @@ document.addEventListener('DOMContentLoaded', () => {
             if (onMemberSelect) {
                 actionBtn = `<button class="btn btn-xs btn-success btn-select-member"><i class="fas fa-check"></i> Selecionar</button>`;
             } else {
-                actionBtn = '<span class="text-muted">-</span>';
+                const existingNick = (groupData.nicks || []).find(n => n.numero === p.pn);
+                const currentApelido = existingNick ? existingNick.apelido : '';
+                actionBtn = `<input type="text" class="input-nickname" value="${currentApelido}" data-pn="${p.pn}" placeholder="Definir apelido..." style="width: 100%; min-width: 120px;" />`;
             }
 
             const pn = p.pn ? p.pn.split('@')[0] : '-';
@@ -1524,6 +1576,33 @@ document.addEventListener('DOMContentLoaded', () => {
                     onMemberSelect(p);
                     els.memberModal.classList.add('hidden');
                 };
+            } else {
+                const input = tr.querySelector('.input-nickname');
+                if (input) {
+                    input.onchange = (e) => {
+                        const newNick = e.target.value.trim();
+                        const pn = e.target.dataset.pn;
+                        
+                        if (!groupData.nicks) {
+                            groupData.nicks = [];
+                        }
+                        
+                        const idx = groupData.nicks.findIndex(n => n.numero === pn);
+                        if (idx !== -1) {
+                            if (newNick) {
+                                groupData.nicks[idx].apelido = newNick.substring(0, 20);
+                            } else {
+                                groupData.nicks.splice(idx, 1);
+                            }
+                        } else if (newNick) {
+                            groupData.nicks.push({
+                                numero: pn,
+                                apelido: newNick.substring(0, 20)
+                            });
+                        }
+                        setDirty(true);
+                    };
+                }
             }
 
             tbody.appendChild(tr);
@@ -1533,7 +1612,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (els.btnViewMembers) {
         els.btnViewMembers.onclick = () => {
             onMemberSelect = null;
-            els.memberModalTitle.textContent = 'Membros do Grupo';
+            els.memberModalTitle.textContent = 'Membros do Grupo & Apelidos';
             els.memberSearch.value = '';
             renderMembers();
             els.memberModal.classList.remove('hidden');
@@ -1562,6 +1641,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (!currentCmdMentions.includes(id)) {
                     currentCmdMentions.push(id);
                     renderCmdTags();
+                    setDirty(true);
+
+                    // Adiciona a tag {mention-userPart} ao final da resposta de texto
+                    const userPart = id.split('@')[0];
+                    const textareas = document.querySelectorAll('textarea.cmd-response-input');
+                    const lastTextarea = textareas[textareas.length - 1];
+                    if (lastTextarea) {
+                        const space = lastTextarea.value && !lastTextarea.value.endsWith(' ') ? ' ' : '';
+                        lastTextarea.value = lastTextarea.value + space + `{mention-${userPart}}`;
+                        lastTextarea.dispatchEvent(new Event('input'));
+                    }
                 }
             };
             els.memberModalTitle.textContent = 'Selecionar Membro';
@@ -1585,14 +1675,31 @@ document.addEventListener('DOMContentLoaded', () => {
             
             const tag = document.createElement('span');
             tag.className = 'tag';
-            tag.innerHTML = `${displayId} <span class="remove">&times;</span>`;
+            tag.innerHTML = `${displayId} <span class="insert-var" title="Inserir variável no texto da resposta" style="margin-left: 5px; cursor: pointer; color: var(--primary-color, #007bff);"><i class="fas fa-plus"></i></span> <span class="remove">&times;</span>`;
             
+            tag.querySelector('.insert-var').onclick = () => {
+                const userPart = id.split('@')[0];
+                const textareas = document.querySelectorAll('textarea.cmd-response-input');
+                const lastTextarea = textareas[textareas.length - 1];
+                if (lastTextarea) {
+                    const space = lastTextarea.value && !lastTextarea.value.endsWith(' ') ? ' ' : '';
+                    lastTextarea.value = lastTextarea.value + space + `{mention-${userPart}}`;
+                    lastTextarea.dispatchEvent(new Event('input'));
+                    setDirty(true);
+                }
+            };
+
             tag.querySelector('.remove').onclick = () => {
                 currentCmdMentions = currentCmdMentions.filter(m => m !== id);
                 renderCmdTags();
+                setDirty(true);
             };
             container.appendChild(tag);
         });
+
+        if (els.cmdTagsHelper) {
+            els.cmdTagsHelper.classList.toggle('hidden', currentCmdMentions.length === 0);
+        }
     }
 
     function setupEventListeners() {
@@ -1663,6 +1770,46 @@ document.addEventListener('DOMContentLoaded', () => {
         if(cooldownSlider) {
             cooldownSlider.addEventListener('input', (e) => {
                 document.getElementById('cooldown-val').textContent = e.target.value;
+            });
+        }
+
+        const proporcaoSlider = document.getElementById('interaction-proporcao');
+        if (proporcaoSlider) {
+            proporcaoSlider.addEventListener('input', (e) => {
+                const val = parseInt(e.target.value);
+                document.getElementById('proporcao-val').textContent = val;
+                const iaChance = val;
+                const cmdChance = 100 - val;
+                const descEl = document.getElementById('proporcao-desc');
+                if (descEl) {
+                    if (iaChance === 100) {
+                        descEl.innerHTML = "Usando apenas <b>IA</b> para interagir";
+                    } else if (iaChance === 0) {
+                        descEl.innerHTML = "Usando apenas <b>comandos</b> para interagir";
+                    } else {
+                        descEl.textContent = `${cmdChance}% de chance de usar algum comando, ${iaChance}% de chance de usar IA para interagir`;
+                    }
+                }
+            });
+        }
+
+        // Cmd cooldown live label
+        const cmdCooldownInput = document.getElementById('cmd-cooldown');
+        if (cmdCooldownInput) {
+            function formatCooldownSeconds(s) {
+                const val = parseInt(s);
+                if (isNaN(val) || val <= 0) return 'sem cooldown';
+                if (val < 60) return `${val}s`;
+                if (val < 3600) {
+                    const m = Math.floor(val / 60), sec = val % 60;
+                    return sec > 0 ? `${m}m ${sec}s` : `${m}m`;
+                }
+                const h = Math.floor(val / 3600), m = Math.floor((val % 3600) / 60);
+                return m > 0 ? `${h}h ${m}m` : `${h}h`;
+            }
+            cmdCooldownInput.addEventListener('input', (e) => {
+                const lbl = document.getElementById('cmd-cooldown-label');
+                if (lbl) lbl.textContent = `segundos  (${formatCooldownSeconds(e.target.value)})`;
             });
         }
     }

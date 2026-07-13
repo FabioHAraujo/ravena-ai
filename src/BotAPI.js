@@ -5,14 +5,20 @@ const Logger = require("./utils/Logger");
 const Database = require("./utils/Database");
 const path = require("path");
 const multer = require("multer");
-const upload = multer({ dest: "uploads/" });
+const ffmpeg = require("fluent-ffmpeg");
+const upload = multer({
+	dest: "uploads/",
+	limits: { fileSize: 50 * 1024 * 1024 }
+});
 const fs = require("fs").promises;
 const qrcode = require("qr-base64");
 const { exec, spawn } = require("child_process");
 const axios = require("axios");
 const WebManagement = require("./utils/WebManagement");
+const { v4: uuidv4 } = require("uuid");
 const { CATEGORY_EMOJIS, COMMAND_ORDER } = require("./functions/MenuOrder");
 const ServiceProviderService = require("./services/ServiceProviderService");
+const SpeechCommands = require("./functions/SpeechCommands");
 
 const WEBHOOK_RATE_LIMIT = 120000;
 
@@ -33,6 +39,7 @@ class BotAPI {
 		this.logger = new Logger("bot-api");
 		this.database = Database.getInstance();
 		this.app = express();
+		this.app.set("trust proxy", true);
 
 		// Inject botApi reference into bots
 		this.bots.forEach((bot) => {
@@ -42,6 +49,7 @@ class BotAPI {
 		// Webhook Server Init
 		if (process.env.GROUP_WEBHOOKS) {
 			this.webhookApp = express();
+			this.webhookApp.set("trust proxy", true);
 			this.webhookLogger = new Logger("group-webhooks");
 			this.webhooksCache = new Map(); // groupId -> [webhooks]
 			this.webhookRateLimits = new Map(); // botId:groupId -> { lastSent, buffer, timeout }
@@ -94,6 +102,7 @@ class BotAPI {
 			data: []
 		};
 
+		this.isUpdatingAnalytics = false;
 		this.sseClients = [];
 
 		if (this.eventHandler) {
@@ -115,6 +124,7 @@ class BotAPI {
 		this.updateAnalyticsCache();
 
 		this.serviceProviderService = ServiceProviderService.getInstance();
+		this.sttJobs = new Map();
 
 		// Configura atualização periódica do cache (a cada 10 minutos)
 		this.cacheUpdateInterval = setInterval(
@@ -124,6 +134,16 @@ class BotAPI {
 
 		// Configura verificação periódica de serviços (a cada 30 segundos)
 		this.checkServicesInterval = setInterval(() => this.checkServices(), 30000);
+
+		// Limpeza periódica de jobs de STT (a cada hora)
+		this.sttCleanupInterval = setInterval(() => {
+			const now = Date.now();
+			for (const [id, job] of this.sttJobs.entries()) {
+				if (now - job.startTime > 3600000) {
+					this.sttJobs.delete(id);
+				}
+			}
+		}, 3600000);
 	}
 
 	/**
@@ -147,7 +167,7 @@ class BotAPI {
 			imagine: "down",
 			llm: "down",
 			whisper: "down",
-			alltalk: "down",
+			f5tts: "down",
 			sdwebui: "down"
 		};
 
@@ -190,11 +210,11 @@ class BotAPI {
 			return "down";
 		};
 
-		services.imagine = await checkCategoryStatus("comfyui");
+		services.imagine = await checkCategoryStatus("bonsai");
 		const LLMService = require("./services/LLMService");
 		services.llm = LLMService.getInstance().getDetailedStatus();
 		services.whisper = await checkCategoryStatus("whisper");
-		services.alltalk = await checkCategoryStatus("alltalk");
+		services.f5tts = await checkCategoryStatus("f5tts");
 		services.sdwebui = await checkCategoryStatus("sdwebui");
 
 		this.lastServicesStatus = services;
@@ -469,6 +489,26 @@ class BotAPI {
 			}
 		});
 
+		// Endpoint para testar o layout da página 502
+		this.app.get("/502", async (req, res) => {
+			try {
+				const fallbackPath = path.join(__dirname, "../fallback-proxy/fallback.html");
+				let html = await fs.readFile(fallbackPath, "utf8");
+
+				const reasonHtml = `<div class="reason-box">
+					<span class="reason-title"><i class="fas fa-info-circle"></i> Modo de Teste:</span>
+					<p class="reason-text">Esta é uma demonstração do layout da página de indisponibilidade (Erro 502) acionada para testes pelo administrador.</p>
+				</div>`;
+
+				html = html.replace("{{MOTIVO}}", reasonHtml);
+				res.setHeader("Content-Type", "text/html; charset=utf-8");
+				res.status(200).send(html);
+			} catch (error) {
+				this.logger.error("Erro ao carregar página de teste 502:", error);
+				res.status(500).send("Erro interno ao carregar a página de teste 502.");
+			}
+		});
+
 		this.app.get("/logout/:botId", authenticateBasic, this.strictLimiter, async (req, res) => {
 			const { botId } = req.params;
 			const bot = this.bots.find((b) => b.id === botId);
@@ -504,6 +544,50 @@ class BotAPI {
 				res.status(500).json({ status: "error", message: e.message, details: e.stack });
 			}
 		});
+
+		this.app.post(
+			"/passkey/respond/:botId",
+			authenticateBasic,
+			this.strictLimiter,
+			async (req, res) => {
+				const { botId } = req.params;
+				const bot = this.bots.find((b) => b.id === botId);
+				if (!bot) {
+					return res
+						.status(404)
+						.json({ status: "error", message: `Bot com ID '${botId}' não encontrado` });
+				}
+				try {
+					const response = await bot.apiClient.post("/instance/passkey/respond", req.body);
+					res.json(response.data || response);
+				} catch (e) {
+					this.logger.error(`[API] Error during passkey respond for bot '${botId}':`, e);
+					res.status(500).json({ status: "error", message: e.message, details: e.stack });
+				}
+			}
+		);
+
+		this.app.post(
+			"/passkey/confirm/:botId",
+			authenticateBasic,
+			this.strictLimiter,
+			async (req, res) => {
+				const { botId } = req.params;
+				const bot = this.bots.find((b) => b.id === botId);
+				if (!bot) {
+					return res
+						.status(404)
+						.json({ status: "error", message: `Bot com ID '${botId}' não encontrado` });
+				}
+				try {
+					const response = await bot.apiClient.post("/instance/passkey/confirm", {});
+					res.json(response.data || response);
+				} catch (e) {
+					this.logger.error(`[API] Error during passkey confirm for bot '${botId}':`, e);
+					res.status(500).json({ status: "error", message: e.message, details: e.stack });
+				}
+			}
+		);
 
 		// Webhook de doação do Tipa.ai
 		this.app.post("/donate_tipa", this.strictLimiter, async (req, res) => {
@@ -767,6 +851,22 @@ class BotAPI {
 			res.sendFile(filePath);
 		});
 
+		// Redireciona para o convite do Discord
+		this.app.get("/discord", (req, res) => {
+			if (process.env.DISCORD_INVITE_LINK) {
+				return res.redirect(process.env.DISCORD_INVITE_LINK);
+			}
+			res.redirect("/");
+		});
+
+		// Redireciona para o convite do Telegram
+		this.app.get("/telegram", (req, res) => {
+			if (process.env.TELEGRAM_INVITE_LINK) {
+				return res.redirect(process.env.TELEGRAM_INVITE_LINK);
+			}
+			res.redirect("/");
+		});
+
 		// Serve public commands page
 		this.app.get("/cmd", (req, res) => {
 			const filePath = path.join(__dirname, "../public/cmd.html");
@@ -777,6 +877,290 @@ class BotAPI {
 		this.app.get("/ajuda", (req, res) => {
 			const filePath = path.join(__dirname, "../public/ajuda.html");
 			res.sendFile(filePath);
+		});
+
+		// Serve STT page
+		const serveSTT = (req, res) => {
+			const providers = this.serviceProviderService.getProviders("whisper");
+			if (providers.length === 0) {
+				return res
+					.status(503)
+					.send("Serviço de transcrição não disponível (nenhum provider configurado).");
+			}
+			const filePath = path.join(__dirname, "../public/stt.html");
+			res.sendFile(filePath);
+		};
+		this.app.get("/stt", serveSTT);
+		this.app.get("/transcrever", serveSTT);
+
+		// Serve Imagine page
+		const serveImagine = (req, res) => {
+			const providers = this.serviceProviderService.getProviders("bonsai");
+			if (providers.length === 0) {
+				return res
+					.status(503)
+					.send("Serviço de geração de imagens não disponível (nenhum provider configurado).");
+			}
+			const filePath = path.join(__dirname, "../public/imagine.html");
+			res.sendFile(filePath);
+		};
+		this.app.get("/imagine", serveImagine);
+
+		// Serve TTS page
+		const serveTTS = (req, res) => {
+			const providers = this.serviceProviderService.getProviders("f5tts");
+			if (providers.length === 0) {
+				return res.status(503).send("Serviço de TTS não disponível (nenhum provider configurado).");
+			}
+			const filePath = path.join(__dirname, "../public/tts.html");
+			res.sendFile(filePath);
+		};
+		this.app.get("/tts", serveTTS);
+		this.app.get("/falar", serveTTS);
+
+		// Serve Pesca page
+		const servePesca = (req, res) => {
+			const filePath = path.join(__dirname, "../public/pesca.html");
+			res.sendFile(filePath);
+		};
+		this.app.get("/pesca", servePesca);
+		this.app.get("/fishing", servePesca);
+
+		// STT API
+		this.app.post(
+			"/api/stt/transcrever",
+			this.strictLimiter,
+			upload.single("audio"),
+			async (req, res) => {
+				if (!req.file) {
+					return res.status(400).json({ error: "Nenhum arquivo enviado." });
+				}
+
+				const providers = this.serviceProviderService.getProviders("whisper");
+				if (
+					providers.length === 0 ||
+					(this.lastServicesStatus && this.lastServicesStatus.whisper === "down")
+				) {
+					return res.status(503).json({ error: "Serviço de transcrição não disponível." });
+				}
+
+				const jobId = uuidv4();
+				const job = {
+					id: jobId,
+					status: "starting",
+					estimatedTime: 0,
+					result: null,
+					error: null,
+					startTime: Date.now()
+				};
+				this.sttJobs.set(jobId, job);
+
+				// Process in background
+				(async () => {
+					let finalPath = req.file.path;
+					const filesToCleanup = [req.file.path];
+
+					try {
+						// Se for vídeo, converte para áudio MP3 (compactado)
+						if (req.file.mimetype.startsWith("video/")) {
+							job.status = "processing";
+							const audioPath = req.file.path + ".mp3";
+							await new Promise((resolve, reject) => {
+								ffmpeg(req.file.path)
+									.toFormat("mp3")
+									.audioBitrate("64k") // Compactado como pedido
+									.on("error", reject)
+									.on("end", resolve)
+									.save(audioPath);
+							});
+							finalPath = audioPath;
+							filesToCleanup.push(audioPath);
+						}
+
+						await SpeechCommands.transcribeViaAPI(
+							finalPath,
+							(duration, estimatedTime) => {
+								job.status = "transcribing";
+								job.estimatedTime = estimatedTime;
+							},
+							(status, executionId, url) => {
+								job.status = status;
+								job.executionId = executionId;
+							}
+						)
+							.then((result) => {
+								job.status = "complete";
+								job.result = result.text;
+							})
+							.catch((err) => {
+								job.status = "error";
+								job.error = err.message;
+							});
+					} catch (err) {
+						this.logger.error("Erro no processamento de STT:", err);
+						job.status = "error";
+						job.error = "Erro ao processar arquivo: " + err.message;
+					} finally {
+						// Limpeza de todos os arquivos temporários
+						for (const f of filesToCleanup) {
+							await fs.unlink(f).catch(() => {});
+						}
+					}
+				})();
+
+				res.json({ jobId });
+			}
+		);
+
+		// Imagine API (Proxy)
+		this.app.post("/api/imagine/generate", this.strictLimiter, async (req, res) => {
+			const { prompt } = req.body;
+
+			if (!prompt || prompt.trim().length < 4) {
+				return res.status(400).json({ error: "Prompt muito curto ou ausente." });
+			}
+
+			if (prompt.length > 1000) {
+				return res.status(400).json({ error: "Prompt muito longo (máximo 1000 caracteres)." });
+			}
+
+			const providers = this.serviceProviderService.getProviders("bonsai");
+			if (
+				providers.length === 0 ||
+				(this.lastServicesStatus && this.lastServicesStatus.imagine === "down")
+			) {
+				return res.status(503).json({ error: "Serviço de geração de imagens não disponível." });
+			}
+
+			try {
+				const bonsaiUrl = providers[0].url;
+				const aesthetic = "\n\n(Aesthetic: Gothic, lightly purple-ish tinted atmosphere, cartoony)";
+
+				this.logger.info(`Web request: Gerando imagem com Bonsai, prompt: '${prompt}'`);
+
+				const response = await axios.post(
+					`${bonsaiUrl}/generate`,
+					{
+						prompt: prompt + aesthetic,
+						width: 1024,
+						height: 1024,
+						seed: Math.floor(Math.random() * 9999999),
+						num_inference_steps: 20,
+						guidance_scale: 7.5
+					},
+					{
+						responseType: "arraybuffer",
+						timeout: 60000
+					}
+				);
+
+				res.set("Content-Type", "image/jpeg");
+				res.send(response.data);
+			} catch (error) {
+				this.logger.error("Erro na API de geração de imagem:", error);
+				res.status(500).json({ error: "Erro ao gerar imagem: " + error.message });
+			}
+		});
+
+		// TTS API (Proxy)
+		this.app.post("/api/tts/generate", this.strictLimiter, async (req, res) => {
+			const { text, voice } = req.body;
+
+			if (!text || text.trim().length < 1) {
+				return res.status(400).json({ error: "Texto ausente." });
+			}
+
+			if (text.length > 1000) {
+				return res.status(400).json({ error: "Texto muito longo (máximo 1000 caracteres)." });
+			}
+
+			const providers = this.serviceProviderService.getProviders("f5tts");
+			if (
+				providers.length === 0 ||
+				(this.lastServicesStatus && this.lastServicesStatus.f5tts === "down")
+			) {
+				return res.status(503).json({ error: "Serviço de TTS não disponível." });
+			}
+
+			try {
+				const f5ttsUrl = providers[0].url || "http://localhost:5050";
+				const f5ttsApiKey = providers[0].apiKey || "";
+				const apiUrl = `${f5ttsUrl}/v1/audio/speech`;
+
+				this.logger.info(
+					`Web request: Gerando TTS com voz ${voice}, texto: '${text.substring(0, 30)}...'`
+				);
+
+				const audioResponse = await axios({
+					method: "post",
+					url: apiUrl,
+					data: {
+						model: "f5-tts",
+						input: text,
+						voice: voice || "ravena",
+						response_format: "mp3"
+					},
+					headers: {
+						"Content-Type": "application/json",
+						...(f5ttsApiKey ? { Authorization: `Bearer ${f5ttsApiKey}` } : {})
+					},
+					responseType: "arraybuffer"
+				});
+
+				res.set("Content-Type", "audio/mpeg");
+				res.send(audioResponse.data);
+			} catch (error) {
+				this.logger.error("Erro na API de TTS:", error);
+				res.status(500).json({ error: "Erro ao gerar áudio: " + error.message });
+			}
+		});
+
+		this.app.get("/api/stt/status/:jobId", (req, res) => {
+			const job = this.sttJobs.get(req.params.jobId);
+			if (!job) {
+				return res.status(404).json({ error: "Job não encontrado." });
+			}
+			res.json(job);
+		});
+
+		// Endpoint para status dos serviços
+		this.app.get("/api/services/status", (req, res) => {
+			res.json(
+				this.lastServicesStatus || {
+					whisper: "unknown",
+					imagine: "unknown",
+					f5tts: "unknown",
+					llm: "unknown"
+				}
+			);
+		});
+
+		// Fishing API
+		this.app.get("/api/fishing/legendary", async (req, res) => {
+			try {
+				const rows = await this.database.dbAll(
+					"fishing",
+					"SELECT * FROM fishing_legendary_history ORDER BY weight DESC;"
+				);
+				res.json(rows);
+			} catch (error) {
+				this.logger.error("Erro ao buscar histórico de pesca:", error);
+				res.status(500).json({ error: "Erro ao buscar histórico de pesca" });
+			}
+		});
+
+		this.app.get("/api/fishing/image/:fileName", async (req, res) => {
+			const { fileName } = req.params;
+			if (fileName.includes("..") || fileName.includes("/") || fileName.includes("\\")) {
+				return res.status(400).send("Nome de arquivo inválido");
+			}
+			const filePath = path.join(this.database.databasePath, "media", fileName);
+			try {
+				await fs.access(filePath);
+				res.sendFile(filePath);
+			} catch (error) {
+				res.status(404).send("Imagem não encontrada");
+			}
 		});
 
 		// Chat API for AnythingLLM help
@@ -1324,12 +1708,13 @@ class BotAPI {
 					return res.status(404).json({ success: false, message: "Group not found" });
 				}
 
-				// Validate group name: alphanumeric, no whitespace, 1-20 chars
+				// Validate group name: alphanumeric + _ - ., no whitespace, 1-30 chars
 				if (changes.name) {
-					if (!/^[a-zA-Z0-9]{1,20}$/.test(changes.name)) {
+					changes.name = changes.name.trim().toLowerCase();
+					if (!/^[a-zA-Z0-9_\-.]{1,30}$/.test(changes.name)) {
 						return res.status(400).json({
 							success: false,
-							message: `O nome do grupo deve ser alfanumérico, sem espaços e ter entre 1 e 20 caracteres.`
+							message: `O nome do grupo deve conter apenas letras, números, _, - e ., sem espaços, com no máximo 30 caracteres.`
 						});
 					}
 				}
@@ -1633,6 +2018,23 @@ class BotAPI {
 				if (!webManagementData || webManagementData.groupId !== groupId)
 					return res.status(401).json({ message: "Unauthorized" });
 
+				const groupData = await this.database.getGroup(groupId);
+				const prefix = (groupData && groupData.prefix ? groupData.prefix : "!").trim();
+
+				if (command && typeof command.startsWith === "string") {
+					let triggerClean = command.startsWith.trim().toLowerCase();
+					if (triggerClean.startsWith(prefix)) {
+						triggerClean = triggerClean.substring(prefix.length).trim();
+					} else if (prefix !== "!" && triggerClean.startsWith("!")) {
+						triggerClean = triggerClean.substring(1).trim();
+					}
+					command.startsWith = triggerClean;
+				}
+
+				if (!command.startsWith) {
+					return res.status(400).json({ message: "Gatilho de comando inválido" });
+				}
+
 				await checkGroupLimits(groupId, "commands", { isNew: true });
 
 				await this.database.saveCustomCommand(groupId, command);
@@ -1656,10 +2058,22 @@ class BotAPI {
 				if (!webManagementData || webManagementData.groupId !== groupId)
 					return res.status(401).json({ message: "Unauthorized" });
 
-				// Database update usually needs the object.
-				// If the trigger changed, we might need to delete old and save new?
-				// Management.js uses 'updateCustomCommand' which likely matches by 'startsWith'.
-				// If 'startsWith' in 'command' body is different from 'trigger' param, it means rename.
+				const groupData = await this.database.getGroup(groupId);
+				const prefix = (groupData && groupData.prefix ? groupData.prefix : "!").trim();
+
+				if (command && typeof command.startsWith === "string") {
+					let triggerClean = command.startsWith.trim().toLowerCase();
+					if (triggerClean.startsWith(prefix)) {
+						triggerClean = triggerClean.substring(prefix.length).trim();
+					} else if (prefix !== "!" && triggerClean.startsWith("!")) {
+						triggerClean = triggerClean.substring(1).trim();
+					}
+					command.startsWith = triggerClean;
+				}
+
+				if (!command.startsWith) {
+					return res.status(400).json({ message: "Gatilho de comando inválido" });
+				}
 
 				const oldTrigger = decodeURIComponent(trigger);
 				const newTrigger = command.startsWith;
@@ -1736,7 +2150,30 @@ class BotAPI {
 			res.sendFile(filePath);
 		});
 
+		this.app.get("/qrcode-status/:botId", authenticateBasic, async (req, res) => {
+			res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+			res.setHeader("Pragma", "no-cache");
+			res.setHeader("Expires", "0");
+			const { botId } = req.params;
+			const bot = this.bots.find((b) => b.id === botId);
+			if (!bot) {
+				return res
+					.status(404)
+					.json({ status: "error", message: `Bot com ID '${botId}' não encontrado` });
+			}
+			try {
+				const instanceStatus = await bot._checkInstanceStatusAndConnect(true, false);
+				res.json(instanceStatus);
+			} catch (e) {
+				this.logger.error("Error checking qrcode status:", e);
+				res.status(500).json({ status: "error", message: e.message });
+			}
+		});
+
 		this.app.get("/qrcode/:botId", authenticateBasic, async (req, res) => {
+			res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+			res.setHeader("Pragma", "no-cache");
+			res.setHeader("Expires", "0");
 			const { botId } = req.params;
 
 			const bot = this.bots.find((b) => b.id === botId);
@@ -1782,23 +2219,55 @@ class BotAPI {
           ${statusPre}
         `;
 			} else {
-				const pairingCodeContent = instanceStatus.extra?.connectData?.pairingCode ?? "xxx xxx";
-				const codigoGerar = instanceStatus.extra?.connectData?.code ?? "";
+				const connectData = instanceStatus.extra?.connectData;
+				let pairingCodeContent = connectData?.pairingCode ?? "";
+				let pairingStyle = "text-align: center; font-size: 35pt;";
 
-				// Só gera se for um QRCode válido
+				// Usa a imagem base64 diretamente se disponível, senão tenta gerar do code
 				let qrCodeBase64 = "";
 				let descQrCode = "Nenhum QRCode disponível";
 
-				if (codigoGerar.length > 200 && !codigoGerar.includes("undefined")) {
-					qrCodeBase64 = qrcode(codigoGerar);
-					descQrCode = codigoGerar;
+				if (
+					!connectData ||
+					(!connectData.qrCode && !connectData.pairingCode && !connectData.code)
+				) {
+					// Inicializando conexão
+					pairingCodeContent =
+						"Gerando códigos de conexão...\nPor favor, aguarde de 5 a 10 segundos.";
+					pairingStyle =
+						"text-align: center; font-size: 11pt; color: #718096; padding: 1rem; line-height: 1.4;";
+					descQrCode = "Inicializando conexão...";
+				} else {
+					const qrCodeBase64img = connectData.qrCode ?? "";
+					const codigoGerar = connectData.code ?? "";
+
+					if (qrCodeBase64img) {
+						qrCodeBase64 = qrCodeBase64img; // já é data:image/png;base64,...
+						descQrCode = codigoGerar;
+					} else if (codigoGerar.length > 200 && !codigoGerar.includes("undefined")) {
+						qrCodeBase64 = qrcode(codigoGerar);
+						descQrCode = codigoGerar;
+					}
+
+					if (!pairingCodeContent) {
+						pairingCodeContent =
+							"WhatsApp limitou a geração de códigos temporariamente (Rate Limit 429).\nPor favor, utilize o QR Code acima para conectar.";
+						pairingStyle =
+							"text-align: center; font-size: 11pt; color: #e53e3e; padding: 1rem; line-height: 1.4;";
+					}
+				}
+
+				let passkeySection = "";
+				if (instanceStatus.extra?.lastPasskeyRequest) {
+					passkeySection = `<div id="passkey-section"></div>`;
 				}
 
 				pageContent = `
+          ${passkeySection}
           <h2>QR Code</h2>
           <img src="${qrCodeBase64}" alt="${descQrCode}">
           <h2>Pairing Code</h2>
-          <pre style="text-align: center;font-size: 35pt;">${pairingCodeContent.split("] ").join("]")}</pre>
+          <pre style="${pairingStyle}">${pairingCodeContent}</pre>
           ${buttons}
           ${statusPre}
         `;
@@ -1819,8 +2288,11 @@ class BotAPI {
             img { max-width: 100%; height: auto; margin: 1.5rem 0; border-radius: 0.5rem; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08); }
             pre { background-color: #e2e8f0; padding: 1rem; border-radius: 0.5rem; white-space: pre-wrap; word-wrap: break-word; font-family: monospace; color: #2d3748; text-align: left; }
             button { padding: 0.5rem 1rem; border: none; border-radius: 0.375rem; background-color: #4299e1; color: white; font-weight: 600; cursor: pointer; transition: background-color 0.2s; }
-            button:hover { background-color: #3182ce; }
             .container div { margin: 1rem 0; display: flex; justify-content: center; gap: 10px; }
+            @keyframes spin {
+              0% { transform: rotate(0deg); }
+              100% { transform: rotate(360deg); }
+            }
           </style>
         </head>
         <body>
@@ -1831,21 +2303,354 @@ class BotAPI {
           </div>
           <script>
             const statusBox = document.getElementById('status-box');
+            const container = document.querySelector('.container');
+            let currentPasskeyChallenge = ${JSON.stringify(instanceStatus.extra?.lastPasskeyRequest || null)};
+            let passkeyPrompted = false;
+
             async function fetchAndShow(url, action) {
-              if (!statusBox) return;
+              if (action !== 'recriar' && !statusBox) return;
               if (!confirm('Tem certeza que deseja '+action+'?')) return;
-              statusBox.textContent = 'Executando... Por favor, aguarde.';
-              try {
-                const response = await fetch(url); // Browser should send auth header
-                const result = await response.json();
-                statusBox.textContent = JSON.stringify(result, null, 2);
-                if (action === 'reload' && response.ok) {
-                  statusBox.textContent += \`\n\nAção concluída. Recarregando em 2 segundos...\`;
-                  setTimeout(() => window.location.reload(), 2000);
+              
+              if (action === 'recriar') {
+                // Substitui o conteúdo do container pelo spinner
+                container.innerHTML = \`
+                  <div id="recreate-status" style="padding: 2rem; text-align: center;">
+                    <div style="border: 4px solid #f3f3f3; border-top: 4px solid #3182ce; border-radius: 50%; width: 48px; height: 48px; animation: spin 1s linear infinite; margin: 0 auto 1.5rem auto;"></div>
+                    <h2 style="color: #2b6cb0; font-size: 1.3rem; margin-bottom: 0.5rem;">Recriando Instância...</h2>
+                    <p id="recreate-msg" style="color: #4a5568; font-size: 0.95rem;">Por favor, aguarde enquanto a nova sessão é gerada.</p>
+                  </div>
+                \`;
+                try {
+                  const res = await fetch(url);
+                  const result = await res.json();
+                  const msgEl = document.getElementById('recreate-msg');
+                  if (result.status === 'ok') {
+                    if (msgEl) msgEl.textContent = 'Instância recriada! Recarregando em 3s...';
+                    setTimeout(() => window.location.reload(), 3000);
+                  } else {
+                    if (msgEl) msgEl.textContent = 'Erro: ' + JSON.stringify(result);
+                  }
+                } catch(e) {
+                  const msgEl = document.getElementById('recreate-msg');
+                  if (msgEl) msgEl.textContent = 'Erro de rede. Recarregando em 5s...';
+                  setTimeout(() => window.location.reload(), 5000);
                 }
-              } catch (error) {
-                statusBox.textContent = \`Erro: \${error?.message}\n\${error?.stack}\`;
+              } else {
+                statusBox.textContent = 'Executando... Por favor, aguarde.';
+                try {
+                  const response = await fetch(url);
+                  const result = await response.json();
+                  statusBox.textContent = JSON.stringify(result, null, 2);
+                  if (action === 'reload' && response.ok) {
+                    statusBox.textContent += \`\\n\\nAção concluída. Recarregando em 2 segundos...\`;
+                    setTimeout(() => window.location.reload(), 2000);
+                  }
+                } catch (error) {
+                  statusBox.textContent = \`Erro: \${error?.message}\\n\${error?.stack}\`;
+                }
               }
+            }
+
+            function base64urlToArrayBuffer(base64url) {
+              let base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+              let pad = base64.length % 4;
+              if (pad) {
+                if (pad === 2) base64 += '==';
+                else if (pad === 3) base64 += '=';
+              }
+              let binary = window.atob(base64);
+              let bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return bytes.buffer;
+            }
+
+            function arrayBufferToBase64url(buffer) {
+              let binary = '';
+              let bytes = new Uint8Array(buffer);
+              for (let i = 0; i < bytes.byteLength; i++) {
+                binary += String.fromCharCode(bytes[i]);
+              }
+              let base64 = window.btoa(binary);
+              return base64.replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
+            }
+
+            // Gera o snippet JS que o usuário deve rodar no console do web.whatsapp.com
+            function buildPasskeySnippet(challenge) {
+              const challengeJson = JSON.stringify(challenge);
+              return \`(async () => {
+  const challenge = \${challengeJson};
+
+  function b64uToBuf(value) {
+    var b64 = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    var bin = atob(b64);
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  function bufToB64u(buf) {
+    var bytes = new Uint8Array(buf);
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=/g, "");
+  }
+
+  const options = {
+    challenge: b64uToBuf(challenge.challenge),
+    timeout: challenge.timeout || 60000,
+    rpId: challenge.rpId || "whatsapp.com",
+    allowCredentials: (challenge.allowCredentials || []).map(function (c) {
+      return {
+        type: c.type || "public-key",
+        id: b64uToBuf(c.id),
+        transports: c.transports
+      };
+    }),
+    userVerification: challenge.userVerification || "required"
+  };
+
+  console.log("🔑 Iniciando verificação de Passkey no navegador... Por favor, confirme no seu celular/dispositivo.");
+  try {
+    const cred = await navigator.credentials.get({ publicKey: options });
+    if (!cred) {
+      console.error("❌ Autenticação retornou vazia.");
+      return;
+    }
+    
+    const r = cred.response;
+    const body = {
+      id: cred.id,
+      rawId: bufToB64u(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: bufToB64u(r.clientDataJSON),
+        authenticatorData: bufToB64u(r.authenticatorData),
+        signature: bufToB64u(r.signature)
+      }
+    };
+    if (r.userHandle && r.userHandle.byteLength) {
+      body.response.userHandle = bufToB64u(r.userHandle);
+    }
+
+    const jsonStr = JSON.stringify(body);
+    console.log("%c🔑 SUCESSO! Copie o JSON abaixo e cole de volta na página do Bot:", "color: #1fa855; font-weight: bold; font-size: 14px;");
+    console.log(jsonStr);
+    try {
+      await navigator.clipboard.writeText(jsonStr);
+      console.log("%c📋 O JSON foi copiado automaticamente para a sua área de transferência!", "color: #3182ce; font-weight: bold;");
+    } catch (clipErr) {
+      console.log("Copie o JSON acima manualmente.");
+    }
+  } catch (err) {
+    console.error("❌ Erro ao obter credencial:", err);
+  }
+})()\`;
+            }
+
+            async function submitPasskeyResponse() {
+              const textarea = document.getElementById('passkey-json-input');
+              const msgBox = document.getElementById('passkey-message');
+              const btn = document.getElementById('passkey-submit-btn');
+              if (!textarea || !msgBox) return;
+
+              const raw = textarea.value.trim();
+              if (!raw) {
+                msgBox.innerText = '⚠️ Cole o JSON gerado pelo console antes de enviar.';
+                msgBox.style.color = '#c05621';
+                return;
+              }
+
+              let parsed;
+              try {
+                parsed = JSON.parse(raw);
+              } catch(e) {
+                msgBox.innerText = '⚠️ O texto colado não é um JSON válido. Copie apenas o objeto JSON do console.';
+                msgBox.style.color = '#c05621';
+                return;
+              }
+
+              if (btn) btn.disabled = true;
+              msgBox.innerText = 'Enviando assinatura para o servidor...';
+              msgBox.style.color = '#3182ce';
+
+              try {
+                const res = await fetch(\`/passkey/respond/${botId}\`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(parsed)
+                });
+                const resJson = await res.json();
+                if (res.ok) {
+                  msgBox.innerText = '✅ Passkey enviada com sucesso! Aguardando confirmação do WhatsApp...';
+                  msgBox.style.color = 'green';
+                  setTimeout(() => window.location.reload(), 3000);
+                } else {
+                  msgBox.innerText = '❌ Erro ao enviar passkey: ' + (resJson.error || resJson.message || 'Erro desconhecido');
+                  msgBox.style.color = 'red';
+                  if (btn) btn.disabled = false;
+                }
+              } catch(e) {
+                msgBox.innerText = '❌ Erro de rede: ' + e.message;
+                msgBox.style.color = 'red';
+                if (btn) btn.disabled = false;
+              }
+            }
+
+            function copyToClipboard(text, btnEl) {
+              navigator.clipboard.writeText(text).then(() => {
+                const orig = btnEl.textContent;
+                btnEl.textContent = '✅ Copiado!';
+                setTimeout(() => { btnEl.textContent = orig; }, 2000);
+              });
+            }
+
+            async function checkStatus() {
+              try {
+                const response = await fetch(\`/qrcode-status/${botId}\`);
+                if (!response.ok) return;
+                const status = await response.json();
+
+                if (statusBox) {
+                  statusBox.textContent = JSON.stringify(status, null, '\\t');
+                }
+
+                if (status.extra?.ok) {
+                  window.location.reload();
+                  return;
+                }
+
+                const passkeyChallengeFromStatus = status.extra?.lastPasskeyRequest;
+                if (passkeyChallengeFromStatus) {
+                  currentPasskeyChallenge = passkeyChallengeFromStatus;
+                  
+                  let passkeyDiv = document.getElementById('passkey-section');
+                  if (!passkeyDiv) {
+                    passkeyDiv = document.createElement('div');
+                    passkeyDiv.id = 'passkey-section';
+                    const snippet = buildPasskeySnippet(currentPasskeyChallenge);
+                    passkeyDiv.innerHTML = \`
+                      <div style="margin: 1.5rem 0; padding: 1.5rem; border: 2px solid #ed8936; border-radius: 0.75rem; background-color: #fffaf0; text-align: left;">
+                        <h3 style="margin: 0 0 0.75rem 0; color: #c05621; font-size: 1.1rem; font-weight: 700; text-align: center;">🔑 Verificação de Passkey Necessária</h3>
+                        <p style="font-size: 0.9rem; color: #4a5568; margin: 0 0 1rem 0;">Sua conta do WhatsApp tem <strong>Passkey</strong> ativada. Para conectar o bot, siga os passos abaixo:</p>
+                        
+                        <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.75rem;">
+                          <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0 0 0.4rem 0;">PASSO 1 — Abra o WhatsApp Web</p>
+                          <p style="color:#e2e8f0; font-size:0.85rem; margin:0;">Abra <a href="https://web.whatsapp.com" target="_blank" style="color:#63b3ed;">web.whatsapp.com</a> em uma nova aba (não precisa estar logado).</p>
+                        </div>
+
+                        <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.75rem;">
+                          <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0 0 0.4rem 0;">PASSO 2 — Abra o Console do Navegador</p>
+                          <p style="color:#e2e8f0; font-size:0.85rem; margin:0;">Pressione <kbd style="background:#4a5568;padding:0.15rem 0.4rem;border-radius:0.25rem;font-family:monospace;">F12</kbd> (ou clique com o botão direito → Inspecionar) e vá na aba <strong style="color:#fbd38d;">Console</strong>.</p>
+                        </div>
+
+                        <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.5rem;">
+                          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+                            <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0;">PASSO 3 — Cole e execute este código no console:</p>
+                            <button id="copy-snippet-btn" onclick="copyToClipboard(document.getElementById('passkey-snippet').textContent, this)" style="background:#4a5568;color:#e2e8f0;border:none;border-radius:0.25rem;padding:0.2rem 0.6rem;font-size:0.75rem;cursor:pointer;">📋 Copiar</button>
+                          </div>
+                          <pre id="passkey-snippet" style="background:#1a202c;color:#68d391;padding:0.75rem;border-radius:0.375rem;font-size:0.78rem;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin:0;">\${snippet.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>
+                        </div>
+                        <p style="color:#718096; font-size:0.8rem; margin:0 0 1rem 0; text-align:center;">O navegador vai pedir sua biometria (Touch ID, Face ID ou PIN). Depois, o console exibirá um objeto JSON.</p>
+
+                        <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.75rem;">
+                          <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0 0 0.4rem 0;">PASSO 4 — Cole o JSON resultante aqui:</p>
+                          <textarea id="passkey-json-input" placeholder='Cole aqui o objeto JSON exibido no console...' style="width:100%;height:100px;background:#1a202c;color:#e2e8f0;border:1px solid #4a5568;border-radius:0.375rem;padding:0.5rem;font-family:monospace;font-size:0.78rem;resize:vertical;box-sizing:border-box;"></textarea>
+                        </div>
+
+                        <button id="passkey-submit-btn" onclick="submitPasskeyResponse()" style="width:100%;background:#48bb78;color:white;border:none;border-radius:0.375rem;padding:0.75rem;font-size:1rem;font-weight:700;cursor:pointer;">✅ Enviar Resposta da Passkey</button>
+                        <div id="passkey-message" style="margin-top:0.75rem;font-weight:bold;font-size:0.9rem;text-align:center;"></div>
+                      </div>
+                    \`;
+                    
+                    const qrH2 = container.querySelector('h2');
+                    if (qrH2) {
+                      container.insertBefore(passkeyDiv, qrH2);
+                    } else {
+                      container.appendChild(passkeyDiv);
+                    }
+                  }
+                }
+
+                const connectData = status.extra?.connectData;
+                if (connectData) {
+                  const qrImg = container.querySelector('img');
+                  // Atualiza QR: usa base64 diretamente se disponível, senão busca arquivo do servidor
+                  if (qrImg) {
+                    if (connectData.qrCode) {
+                      qrImg.src = connectData.qrCode;
+                    } else if (connectData.code && connectData.code.length > 200) {
+                      qrImg.src = \`/qrimg/${botId}?t=\` + Date.now();
+                    }
+                  }
+                  
+                  const pairingPre = container.querySelector('pre');
+                  if (pairingPre) {
+                    if (!connectData.qrCode && !connectData.pairingCode && !connectData.code) {
+                      // Conectando
+                      pairingPre.textContent = "Gerando códigos de conexão...\nPor favor, aguarde de 5 a 10 segundos.";
+                      pairingPre.style = "text-align: center; font-size: 11pt; color: #718096; padding: 1rem; line-height: 1.4;";
+                    } else if (connectData.pairingCode) {
+                      pairingPre.textContent = connectData.pairingCode.split("] ").join("]");
+                      pairingPre.style = "text-align: center; font-size: 35pt;";
+                    } else {
+                      // QR Code existe mas pairing code veio vazio -> Rate Limit
+                      pairingPre.textContent = "WhatsApp limitou a geração de códigos temporariamente (Rate Limit 429).\nPor favor, utilize o QR Code acima para conectar.";
+                      pairingPre.style = "text-align: center; font-size: 11pt; color: #e53e3e; padding: 1rem; line-height: 1.4;";
+                    }
+                  }
+                }
+
+              } catch (err) {
+                console.error('Erro ao verificar status:', err);
+              }
+            }
+
+            setInterval(checkStatus, 3000);
+
+            if (currentPasskeyChallenge) {
+              // Se já há um desafio ao carregar a página, exibe o bloco de instruções imediatamente
+              const snippet = buildPasskeySnippet(currentPasskeyChallenge);
+              const passkeyDiv = document.createElement('div');
+              passkeyDiv.id = 'passkey-section';
+              passkeyDiv.innerHTML = \`
+                <div style="margin: 1.5rem 0; padding: 1.5rem; border: 2px solid #ed8936; border-radius: 0.75rem; background-color: #fffaf0; text-align: left;">
+                  <h3 style="margin: 0 0 0.75rem 0; color: #c05621; font-size: 1.1rem; font-weight: 700; text-align: center;">🔑 Verificação de Passkey Necessária</h3>
+                  <p style="font-size: 0.9rem; color: #4a5568; margin: 0 0 1rem 0;">Sua conta do WhatsApp tem <strong>Passkey</strong> ativada. Para conectar o bot, siga os passos abaixo:</p>
+                  
+                  <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.75rem;">
+                    <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0 0 0.4rem 0;">PASSO 1 — Abra o WhatsApp Web</p>
+                    <p style="color:#e2e8f0; font-size:0.85rem; margin:0;">Abra <a href="https://web.whatsapp.com" target="_blank" style="color:#63b3ed;">web.whatsapp.com</a> em uma nova aba (não precisa estar logado).</p>
+                  </div>
+
+                  <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.75rem;">
+                    <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0 0 0.4rem 0;">PASSO 2 — Abra o Console do Navegador</p>
+                    <p style="color:#e2e8f0; font-size:0.85rem; margin:0;">Pressione <kbd style="background:#4a5568;padding:0.15rem 0.4rem;border-radius:0.25rem;font-family:monospace;">F12</kbd> (ou clique com o botão direito → Inspecionar) e vá na aba <strong style="color:#fbd38d;">Console</strong>.</p>
+                  </div>
+
+                  <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.5rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.4rem;">
+                      <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0;">PASSO 3 — Cole e execute este código no console:</p>
+                      <button id="copy-snippet-btn" onclick="copyToClipboard(document.getElementById('passkey-snippet').textContent, this)" style="background:#4a5568;color:#e2e8f0;border:none;border-radius:0.25rem;padding:0.2rem 0.6rem;font-size:0.75rem;cursor:pointer;">📋 Copiar</button>
+                    </div>
+                    <pre id="passkey-snippet" style="background:#1a202c;color:#68d391;padding:0.75rem;border-radius:0.375rem;font-size:0.78rem;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin:0;">\${snippet.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>
+                  </div>
+                  <p style="color:#718096; font-size:0.8rem; margin:0 0 1rem 0; text-align:center;">O navegador vai pedir sua biometria (Touch ID, Face ID ou PIN). Depois, o console exibirá um objeto JSON.</p>
+
+                  <div style="background:#2d3748; border-radius:0.5rem; padding:0.75rem 1rem; margin-bottom:0.75rem;">
+                    <p style="color:#f6e05e; font-size:0.8rem; font-weight:600; margin:0 0 0.4rem 0;">PASSO 4 — Cole o JSON resultante aqui:</p>
+                    <textarea id="passkey-json-input" placeholder='Cole aqui o objeto JSON exibido no console...' style="width:100%;height:100px;background:#1a202c;color:#e2e8f0;border:1px solid #4a5568;border-radius:0.375rem;padding:0.5rem;font-family:monospace;font-size:0.78rem;resize:vertical;box-sizing:border-box;"></textarea>
+                  </div>
+
+                  <button id="passkey-submit-btn" onclick="submitPasskeyResponse()" style="width:100%;background:#48bb78;color:white;border:none;border-radius:0.375rem;padding:0.75rem;font-size:1rem;font-weight:700;cursor:pointer;">✅ Enviar Resposta da Passkey</button>
+                  <div id="passkey-message" style="margin-top:0.75rem;font-weight:bold;font-size:0.9rem;text-align:center;"></div>
+                </div>
+              \`;
+              const qrH2 = container.querySelector('h2');
+              if (qrH2) container.insertBefore(passkeyDiv, qrH2);
+              else container.appendChild(passkeyDiv);
             }
           </script>
         </body>
@@ -2077,6 +2882,255 @@ class BotAPI {
 				logStream.kill();
 			});
 		});
+
+		// Copa 2026 notifications endpoint
+		this.app.post("/copa", this.strictLimiter, async (req, res) => {
+			this.logger.info("[Copa Webhook] Request received at /copa", {
+				headers: req.headers,
+				body: req.body
+			});
+
+			try {
+				const { event, match, goalDetails } = req.body;
+
+				if (!event || !match) {
+					this.logger.warn("[Copa Webhook] Invalid payload structure. event or match missing.", {
+						body: req.body
+					});
+					return res
+						.status(400)
+						.json({ status: "error", message: "Payload inválido. Requer 'event' e 'match'." });
+				}
+
+				if (!this.bots || this.bots.length === 0) {
+					this.logger.warn("[Copa Webhook] No bots available to process Copa notifications.");
+					return res.status(503).json({ status: "error", message: "Nenhum bot disponível." });
+				}
+
+				const CopaHelpers = require("./functions/Copa2026");
+				let teamsMap = {};
+				try {
+					teamsMap = await CopaHelpers.fetchTeamsMap();
+					this.logger.info(
+						`[Copa Webhook] Loaded teams map. Total teams: ${Object.keys(teamsMap).length}`
+					);
+				} catch (e) {
+					this.logger.error("Erro ao buscar mapa de times na notificação da Copa:", e.message);
+				}
+
+				const homeTeamId = String(match.home_team_id);
+				const awayTeamId = String(match.away_team_id);
+				this.logger.info(
+					`[Copa Webhook] Event: '${event}', HomeTeamId: ${homeTeamId}, AwayTeamId: ${awayTeamId}`
+				);
+
+				const followers = await this.database.dbAll(
+					"copa_seguir",
+					"SELECT chat_id, team_id, team_name_pt, fifa_code FROM copa_seguindo WHERE team_id = ? OR team_id = ?",
+					[homeTeamId, awayTeamId]
+				);
+
+				this.logger.info(
+					`[Copa Webhook] Database followers count: ${followers ? followers.length : 0}`,
+					{ followers }
+				);
+
+				if (!followers || followers.length === 0) {
+					this.logger.info(
+						`[Copa Webhook] No chats are following home_team_id ${homeTeamId} or away_team_id ${awayTeamId}`
+					);
+					return res.json({ status: "ok", message: "Nenhum chat seguindo estes times." });
+				}
+
+				const chatIds = [...new Set(followers.map((f) => f.chat_id))];
+				const homeTeam = teamsMap[homeTeamId] || {
+					namePt: match.home_team_name_en || "Casa",
+					flagEmoji: CopaHelpers.flag(match.home_fifa_code || "")
+				};
+				const awayTeam = teamsMap[awayTeamId] || {
+					namePt: match.away_team_name_en || "Fora",
+					flagEmoji: CopaHelpers.flag(match.away_fifa_code || "")
+				};
+				this.logger.info(
+					`[Copa Webhook] Teams resolved. Home: ${homeTeam.namePt} (${homeTeamId}), Away: ${awayTeam.namePt} (${awayTeamId}). Chats to notify: ${chatIds.join(", ")}`
+				);
+
+				for (const chatId of chatIds) {
+					const chatFollows = followers.filter((f) => f.chat_id === chatId);
+					const followedNames = chatFollows.map((f) => f.team_name_pt).join(" e ");
+
+					// Token aleatório de 8 chars para evitar detecção de spam (mesmo padrão do InviteSystem)
+					const rndToken = () =>
+						Math.random().toString(36).substring(2, 6) + Math.random().toString(36).substring(2, 6);
+
+					let messageText = "";
+
+					if (event === "match_start") {
+						messageText =
+							`⚽ *A BOLA ROLOU na Copa 2026!* ⚽\n\n` +
+							`🏆 O jogo começou!\n` +
+							`⚔️ ${homeTeam.flagEmoji} *${homeTeam.namePt}* vs ${awayTeam.flagEmoji} *${awayTeam.namePt}*\n\n` +
+							`📌 Grupo/Fase: *${match.group || match.type || "—"}*\n` +
+							`🏟️ Estádio ID: ${match.stadium_id || "—"}\n\n` +
+							`Acompanhe com a gente! 🔴\n\n` +
+							`_${rndToken()}_`;
+					} else if (event === "goal") {
+						const details = goalDetails || {};
+						const scoringTeam = teamsMap[details.scoringTeamId] ||
+							Object.values(teamsMap).find((t) => t.name_en === details.scoringTeamNameEn) || {
+								namePt: details.scoringTeamNameEn || "Autor do Gol",
+								flagEmoji: "⚽"
+							};
+
+						// Sanitiza nome do jogador — rejeita null, "null", vazio
+						const rawPlayer = details.player;
+						const playerClean =
+							rawPlayer && String(rawPlayer).toLowerCase() !== "null" ? rawPlayer.trim() : "";
+						const playerStr = playerClean ? ` (${playerClean})` : "";
+
+						// Subtrai 3 minutos do tempo exibido para compensar delay de notificação
+						const rawMinute = details.minute || match.time_elapsed || "";
+						const minuteNumMatch = rawMinute.toString().match(/^(\d+)'?$/);
+						const displayMinute = minuteNumMatch
+							? `${Math.max(0, Number(minuteNumMatch[1]) - 3)}'`
+							: rawMinute;
+						const minuteStr = displayMinute ? ` aos ${displayMinute}` : "";
+
+						// Mesmo ajuste de -3min no campo "Tempo de jogo"
+						const rawElapsed = match.time_elapsed || "";
+						const elapsedNumMatch = rawElapsed.toString().match(/^(\d+)'?$/);
+						const displayElapsed = elapsedNumMatch
+							? `${Math.max(0, Number(elapsedNumMatch[1]) - 3)}'`
+							: rawElapsed;
+
+						messageText =
+							`⚽ *GOOOOL DA COPA 2026!* ⚽\n\n` +
+							`${scoringTeam.flagEmoji} *Gol do(a) ${scoringTeam.namePt}!*${playerStr}${minuteStr}\n\n` +
+							`⚔️ Placar Atual: ${homeTeam.flagEmoji} *${homeTeam.namePt}* ${match.home_score} x ${match.away_score} ${awayTeam.flagEmoji} *${awayTeam.namePt}*\n\n` +
+							`⏱️ Tempo de jogo: ${displayElapsed || "—"}\n\n` +
+							`_${rndToken()}_`;
+					} else if (event === "match_end") {
+						let resultMessage = "";
+						const chatFollowsHome = chatFollows.some((f) => String(f.team_id) === homeTeamId);
+						const chatFollowsAway = chatFollows.some((f) => String(f.team_id) === awayTeamId);
+
+						const homeScore = Number(match.home_score) || 0;
+						const awayScore = Number(match.away_score) || 0;
+
+						if (homeScore === awayScore) {
+							resultMessage = "🤝 Partida terminada em empate!";
+						} else if (chatFollowsHome && !chatFollowsAway) {
+							if (homeScore > awayScore) {
+								resultMessage = `🥳 *Vitória!* O(A) ${homeTeam.flagEmoji} *${homeTeam.namePt}* venceu a partida! 🏆`;
+							} else {
+								resultMessage = `😢 *Derrota.* O(A) ${homeTeam.flagEmoji} *${homeTeam.namePt}* perdeu a partida.`;
+							}
+						} else if (chatFollowsAway && !chatFollowsHome) {
+							if (awayScore > homeScore) {
+								resultMessage = `🥳 *Vitória!* O(A) ${awayTeam.flagEmoji} *${awayTeam.namePt}* venceu a partida! 🏆`;
+							} else {
+								resultMessage = `😢 *Derrota.* O(A) ${awayTeam.flagEmoji} *${awayTeam.namePt}* perdeu a partida.`;
+							}
+						} else {
+							const winner = homeScore > awayScore ? homeTeam : awayTeam;
+							resultMessage = `🏁 Fim de papo! Vitória do(a) ${winner.flagEmoji} *${winner.namePt}*!`;
+						}
+
+						messageText =
+							`🏁 *FIM DE PARTIDA na Copa 2026!* 🏁\n\n` +
+							`O jogo do(a) *${followedNames}* terminou.\n\n` +
+							`⚔️ Placar Final: ${homeTeam.flagEmoji} *${homeTeam.namePt}* ${homeScore} x ${awayScore} ${awayTeam.flagEmoji} *${awayTeam.namePt}*\n\n` +
+							`${resultMessage}\n\n` +
+							`_${rndToken()}_`;
+					}
+
+					if (messageText) {
+						try {
+							// Determina o bot correto com base no chatId
+							const isWhatsAppChat =
+								chatId.includes("@") ||
+								(/^\d+$/.test(chatId) && chatId.length >= 10 && chatId.length <= 15);
+
+							if (isWhatsAppChat) {
+								const waBots = this.bots.filter(
+									(b) => b.isConnected && !b.useTelegram && !b.useDiscord
+								);
+								if (waBots.length === 0) {
+									const fallbackWa = this.bots.find((b) => !b.useTelegram && !b.useDiscord);
+									if (fallbackWa) waBots.push(fallbackWa);
+								}
+
+								if (waBots.length === 0) {
+									throw new Error(`Nenhum bot do WhatsApp encontrado para o chat: ${chatId}`);
+								}
+
+								let sent = false;
+								let lastError = null;
+								for (const currentBot of waBots) {
+									try {
+										this.logger.info(
+											`[Copa Webhook] Sending notification to chat ${chatId} using bot ${currentBot.id || currentBot.botId}. Message: "${messageText.replace(/\n/g, "\\n")}"`
+										);
+										await currentBot.sendMessage(chatId, messageText);
+										this.logger.info(
+											`[Copa Webhook] Notification sent successfully to chat ${chatId} using bot ${currentBot.id || currentBot.botId}`
+										);
+										sent = true;
+										break;
+									} catch (err) {
+										lastError = err;
+										this.logger.warn(
+											`[Copa Webhook] Failed to send using bot ${currentBot.id || currentBot.botId}: ${err.message || err}. Trying next WhatsApp bot if available.`
+										);
+									}
+								}
+								if (!sent) {
+									throw (
+										lastError ||
+										new Error("Todos os bots de WhatsApp falharam ao enviar a mensagem.")
+									);
+								}
+							} else {
+								let targetBot = null;
+								if (/^\d{17,20}$/.test(chatId)) {
+									targetBot =
+										this.bots.find((b) => b.useDiscord && b.isConnected) ||
+										this.bots.find((b) => b.useDiscord);
+								} else {
+									targetBot =
+										this.bots.find((b) => b.useTelegram && b.isConnected) ||
+										this.bots.find((b) => b.useTelegram);
+								}
+
+								if (!targetBot) {
+									throw new Error(`Nenhum bot compatível encontrado para o chat: ${chatId}`);
+								}
+
+								this.logger.info(
+									`[Copa Webhook] Sending notification to chat ${chatId} using bot ${targetBot.id || targetBot.botId}. Message: "${messageText.replace(/\n/g, "\\n")}"`
+								);
+								await targetBot.sendMessage(chatId, messageText);
+								this.logger.info(`[Copa Webhook] Notification sent successfully to chat ${chatId}`);
+							}
+						} catch (error) {
+							this.logger.error(
+								`Erro ao enviar notificação da Copa para o chat ${chatId}:`,
+								error.message
+							);
+						}
+					} else {
+						this.logger.warn(
+							`[Copa Webhook] Empty message text generated for event '${event}' to chat ${chatId}`
+						);
+					}
+				}
+
+				res.json({ status: "ok", message: "Notificações enviadas." });
+			} catch (error) {
+				this.logger.error("Erro no endpoint /copa:", error);
+				res.status(500).json({ status: "error", message: error.message });
+			}
+		});
 	}
 
 	/**
@@ -2187,103 +3241,183 @@ class BotAPI {
 	 * @returns {Promise<void>}
 	 */
 	async updateAnalyticsCache() {
-		try {
-			this.logger.info("Atualizando cache de dados analíticos...");
+		if (this.isUpdatingAnalytics) {
+			this.logger.warn("Atualização de cache de dados analíticos já em andamento, pulando...");
+			return;
+		}
 
-			// Obtém todos os relatórios de carga
-			// Pegamos dados dos últimos 370 dias para análise anual
+		this.isUpdatingAnalytics = true;
+		try {
+			this.logger.info("Atualizando cache de dados analíticos (otimizado)...");
+
+			// Obtém dados agregados do banco (muito mais rápido que processar 350k linhas no JS)
 			const yearStart = new Date();
 			yearStart.setDate(yearStart.getDate() - 370);
 
-			const reports = await this.database.getLoadReports(yearStart.getTime());
+			const aggregatedData = await this.database.getAggregatedLoadReports(yearStart.getTime());
 
-			if (!reports || !Array.isArray(reports) || reports.length === 0) {
-				this.logger.warn("Nenhum relatório de carga encontrado para processamento analítico");
+			if (!aggregatedData || aggregatedData.length === 0) {
+				this.logger.warn("Nenhum dado analítico encontrado para processamento");
 				this.analyticsCache.lastUpdate = Date.now();
 				return;
 			}
 
-			// Agrupa relatórios por bot
-			const botReports = {};
-			reports.forEach((report) => {
-				if (!botReports[report.botId]) {
-					botReports[report.botId] = [];
+			// Agrupa dados por bot
+			const botDataGroups = {};
+			for (const row of aggregatedData) {
+				if (!botDataGroups[row.botId]) {
+					botDataGroups[row.botId] = [];
 				}
-				botReports[report.botId].push(report);
-			});
+				botDataGroups[row.botId].push(row);
+			}
 
 			// Processa dados para cada bot
-			Object.keys(botReports).forEach((botId) => {
+			for (const botId of Object.keys(botDataGroups)) {
+				const botRows = botDataGroups[botId];
+
 				// Processa dados diários (por hora)
-				this.analyticsCache.daily[botId] = this.processDailyData(botReports[botId]);
+				this.analyticsCache.daily[botId] = this.processDailyDataAggregated(botRows);
 
 				// Processa dados semanais (por dia da semana)
-				this.analyticsCache.weekly[botId] = this.processWeeklyData(botReports[botId]);
+				this.analyticsCache.weekly[botId] = this.processWeeklyDataAggregated(botRows);
 
 				// Processa dados mensais (por dia do mês)
-				this.analyticsCache.monthly[botId] = this.processMonthlyData(botReports[botId]);
+				this.analyticsCache.monthly[botId] = this.processMonthlyDataAggregated(botRows);
 
 				// Processa dados anuais (por dia)
-				this.analyticsCache.yearly[botId] = this.processYearlyData(botReports[botId]);
-			});
+				this.analyticsCache.yearly[botId] = this.processYearlyDataAggregated(botRows);
+
+				await new Promise((resolve) => setImmediate(resolve));
+			}
 
 			// Salva datas comuns para o gráfico anual
 			const yearlyDates = new Set();
-			Object.values(this.analyticsCache.yearly).forEach((data) => {
+			for (const data of Object.values(this.analyticsCache.yearly)) {
 				if (data && data.dates) {
-					data.dates.forEach((date) => yearlyDates.add(date));
+					for (const date of data.dates) {
+						yearlyDates.add(date);
+					}
 				}
-			});
+			}
 
-			// Ordena as datas
 			const sortedDates = Array.from(yearlyDates).sort();
 
-			// Atualiza os dados de cada bot para usar as mesmas datas
-			Object.keys(this.analyticsCache.yearly).forEach((botId) => {
+			// Normaliza os dados anuais para usar as mesmas datas (essencial para o frontend)
+			for (const botId of Object.keys(this.analyticsCache.yearly)) {
 				const botData = this.analyticsCache.yearly[botId];
 				if (botData) {
-					// Cria novo array de valores baseado nas datas ordenadas
 					const newValues = [];
 					const dateValueMap = {};
 
-					// Cria um mapa de data para valor
 					if (botData.dates && botData.values) {
 						for (let i = 0; i < botData.dates.length; i++) {
 							dateValueMap[botData.dates[i]] = botData.values[i] ?? 0;
 						}
 					}
 
-					// Preenche o novo array de valores com base nas datas ordenadas
-					sortedDates.forEach((date) => {
+					for (const date of sortedDates) {
 						newValues.push(dateValueMap[date] ?? 0);
-					});
+					}
 
-					// Atualiza o objeto de dados do bot
 					this.analyticsCache.yearly[botId] = {
 						dates: sortedDates,
 						values: newValues
 					};
 				}
-			});
+				await new Promise((resolve) => setImmediate(resolve));
+			}
 
-			// Atualiza o timestamp da última atualização
 			this.analyticsCache.lastUpdate = Date.now();
 			this.logger.info("Cache de dados analíticos atualizado com sucesso");
 		} catch (error) {
 			this.logger.error("Erro ao atualizar cache de dados analíticos:", error);
+		} finally {
+			this.isUpdatingAnalytics = false;
 		}
+	}
+
+	/**
+	 * Helpers otimizados para dados já agregados por SQL
+	 */
+	processDailyDataAggregated(rows) {
+		const hourSums = Array(24).fill(0);
+		const hourCounts = Array(24).fill(0);
+
+		for (const row of rows) {
+			const hour = new Date(row.hourKey).getHours();
+			hourSums[hour] += row.totalMessages;
+			hourCounts[hour]++;
+		}
+
+		return {
+			values: hourSums.map((sum, i) => (hourCounts[i] > 0 ? Math.round(sum / hourCounts[i]) : 0))
+		};
+	}
+
+	processWeeklyDataAggregated(rows) {
+		// Agrupa por dia primeiro (dateKey)
+		const dailyTotals = {};
+		for (const row of rows) {
+			if (!dailyTotals[row.dateKey]) dailyTotals[row.dateKey] = 0;
+			dailyTotals[row.dateKey] += row.totalMessages;
+		}
+
+		const daySums = Array(7).fill(0);
+		const dayCounts = Array(7).fill(0);
+
+		for (const [dateKey, total] of Object.entries(dailyTotals)) {
+			const dayOfWeek = new Date(dateKey + "T00:00:00Z").getUTCDay();
+			daySums[dayOfWeek] += total;
+			dayCounts[dayOfWeek]++;
+		}
+
+		return {
+			values: daySums.map((sum, i) => (dayCounts[i] > 0 ? Math.round(sum / dayCounts[i]) : 0))
+		};
+	}
+
+	processMonthlyDataAggregated(rows) {
+		const daySums = Array(31).fill(0);
+		const dayCounts = Array(31).fill(0);
+
+		for (const row of rows) {
+			const day = parseInt(row.dayOfMonth) - 1;
+			if (day >= 0 && day < 31) {
+				daySums[day] += row.totalMessages;
+				dayCounts[day]++;
+			}
+		}
+
+		return {
+			values: daySums.map((sum, i) => (dayCounts[i] > 0 ? Math.round(sum / dayCounts[i]) : 0))
+		};
+	}
+
+	processYearlyDataAggregated(rows) {
+		const dailyTotals = {};
+		for (const row of rows) {
+			if (!dailyTotals[row.dateKey]) dailyTotals[row.dateKey] = 0;
+			dailyTotals[row.dateKey] += row.totalMessages;
+		}
+
+		const dates = Object.keys(dailyTotals).sort();
+		const values = dates.map((d) => dailyTotals[d]);
+
+		return { dates, values };
 	}
 
 	/**
 	 * Processa dados diários (por hora)
 	 * @param {Array} reports - Relatórios de carga
-	 * @returns {Object} - Dados processados
+	 * @returns {Promise<Object>} - Dados processados
 	 */
-	processDailyData(reports) {
+	async processDailyData(reports) {
 		try {
 			const hourlyTotalsByDate = {};
+			let count = 0;
 
-			reports.forEach((report) => {
+			for (const report of reports) {
+				if (++count % 1000 === 0) await new Promise((resolve) => setImmediate(resolve));
 				if (report.period && report.period.start && report.messages) {
 					const date = new Date(report.period.start);
 					date.setMinutes(0, 0, 0);
@@ -2294,16 +3428,18 @@ class BotAPI {
 					if (!hourlyTotalsByDate[key]) hourlyTotalsByDate[key] = 0;
 					hourlyTotalsByDate[key] += totalMsgs;
 				}
-			});
+			}
 
 			const hourSums = Array(24).fill(0);
 			const hourCounts = Array(24).fill(0);
 
-			Object.entries(hourlyTotalsByDate).forEach(([key, total]) => {
+			count = 0;
+			for (const [key, total] of Object.entries(hourlyTotalsByDate)) {
+				if (++count % 1000 === 0) await new Promise((resolve) => setImmediate(resolve));
 				const hour = new Date(key).getHours();
 				hourSums[hour] += total;
 				hourCounts[hour]++;
-			});
+			}
 
 			const hourlyAverages = hourSums.map((sum, index) => {
 				const count = hourCounts[index];
@@ -2322,13 +3458,15 @@ class BotAPI {
 	/**
 	 * Processa dados semanais (por dia da semana)
 	 * @param {Array} reports - Relatórios de carga
-	 * @returns {Object} - Dados processados
+	 * @returns {Promise<Object>} - Dados processados
 	 */
-	processWeeklyData(reports) {
+	async processWeeklyData(reports) {
 		try {
 			const dailyTotals = {};
+			let count = 0;
 
-			reports.forEach((report) => {
+			for (const report of reports) {
+				if (++count % 1000 === 0) await new Promise((resolve) => setImmediate(resolve));
 				if (report.period && report.period.start && report.messages) {
 					const dateString = new Date(report.period.start).toISOString().split("T")[0];
 					const totalMsgs = (report.messages.totalReceived ?? 0) + (report.messages.totalSent ?? 0);
@@ -2336,16 +3474,18 @@ class BotAPI {
 					if (!dailyTotals[dateString]) dailyTotals[dateString] = 0;
 					dailyTotals[dateString] += totalMsgs;
 				}
-			});
+			}
 
 			const daySums = Array(7).fill(0);
 			const dayCounts = Array(7).fill(0);
 
-			Object.entries(dailyTotals).forEach(([dateString, total]) => {
+			count = 0;
+			for (const [dateString, total] of Object.entries(dailyTotals)) {
+				if (++count % 1000 === 0) await new Promise((resolve) => setImmediate(resolve));
 				const dayOfWeek = new Date(dateString).getUTCDay();
 				daySums[dayOfWeek] += total;
 				dayCounts[dayOfWeek]++;
-			});
+			}
 
 			const dailyAverages = daySums.map((sum, index) => {
 				const count = dayCounts[index];
@@ -2364,9 +3504,9 @@ class BotAPI {
 	/**
 	 * Processa dados mensais (por dia do mês)
 	 * @param {Array} reports - Relatórios de carga
-	 * @returns {Object} - Dados processados
+	 * @returns {Promise<Object>} - Dados processados
 	 */
-	processMonthlyData(reports) {
+	async processMonthlyData(reports) {
 		try {
 			// Mantido apenas para compatibilidade, mas não será usado no filtro 'monthly'
 			// Inicializa arrays para os 31 dias do mês
@@ -2374,7 +3514,9 @@ class BotAPI {
 			const dayTotals = Array(31).fill(0);
 
 			// Processa cada relatório
-			reports.forEach((report) => {
+			let count = 0;
+			for (const report of reports) {
+				if (++count % 1000 === 0) await new Promise((resolve) => setImmediate(resolve));
 				if (report.period && report.period.start && report.messages) {
 					const date = new Date(report.period.start);
 					const day = date.getDate() - 1; // 0-30
@@ -2386,7 +3528,7 @@ class BotAPI {
 					dayCounts[day]++;
 					dayTotals[day] += totalMsgs;
 				}
-			});
+			}
 
 			// Calcula média por dia do mês
 			const monthlyAverages = dayTotals.map((total, index) => {
@@ -2406,15 +3548,17 @@ class BotAPI {
 	/**
 	 * Processa dados anuais (por dia)
 	 * @param {Array} reports - Relatórios de carga
-	 * @returns {Object} - Dados processados
+	 * @returns {Promise<Object>} - Dados processados
 	 */
-	processYearlyData(reports) {
+	async processYearlyData(reports) {
 		try {
 			// Mapeia totais diários
 			const dailyTotals = {};
 
 			// Processa cada relatório
-			reports.forEach((report) => {
+			let count = 0;
+			for (const report of reports) {
+				if (++count % 1000 === 0) await new Promise((resolve) => setImmediate(resolve));
 				if (report.period && report.period.start && report.messages) {
 					const date = new Date(report.period.start);
 					const dateString = date.toISOString().split("T")[0]; // YYYY-MM-DD
@@ -2428,7 +3572,7 @@ class BotAPI {
 					}
 					dailyTotals[dateString] += totalMsgs;
 				}
-			});
+			}
 
 			// Converte para arrays ordenados por data
 			const dates = Object.keys(dailyTotals).sort();
@@ -3019,6 +4163,10 @@ class BotAPI {
 
 					// Realiza uma verificação inicial logo após iniciar
 					this.checkServices();
+
+					// Limpa o arquivo de motivo de indisponibilidade se ele existir
+					const statusMotivoPath = path.join(__dirname, "../data/status_motivo.txt");
+					fs.unlink(statusMotivoPath).catch(() => {});
 
 					resolve();
 				});

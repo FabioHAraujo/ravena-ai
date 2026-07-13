@@ -29,6 +29,14 @@ class SuperAdmin {
 			testeMsg: { method: "testeMsg", description: "Testar Retorno msg" },
 			sendMsg: { method: "sendMsg", description: "Envia mensagem para chatId" },
 			joinGrupo: { method: "joinGroup", description: "Entra em um grupo via link de convite" },
+			joinGrupoSilencioso: {
+				method: "joinGroupSilent",
+				description: "Entra em um grupo via link de convite SEM enviar mensagem de boas-vindas"
+			},
+			modoSilencioso: {
+				method: "toggleSilentMode",
+				description: "Toggle do modo silencioso global (sem boas-vindas por 30 min)"
+			},
 			addDonate: { method: "addNewDonate", description: "Adiciona novo donate" },
 			addDonateNumero: { method: "addDonorNumber", description: "Adiciona número de um doador" },
 			addDonateValor: { method: "updateDonationAmount", description: "Atualiza valor de doação" },
@@ -103,11 +111,27 @@ class SuperAdmin {
 			fixGroupNames: {
 				method: "fixGroupNames",
 				description: "Escaneia e sugere correção para nomes de grupos (dry run)"
+			},
+			dumpdbs: {
+				method: "dumpDbs",
+				description:
+					"Força o dump em disco (checkpoint WAL) e roda testes de integridade em todos os bancos de dados"
+			},
+			removeUserGp: {
+				method: "removeUserGp",
+				description: "Remove um usuário do grupo: !sa-removeUserGp <grupoJid> <contato>"
+			},
+			addUserGp: {
+				method: "addUserGp",
+				description: "Adiciona um usuário ao grupo: !sa-addUserGp <grupoJid> <contato>"
 			}
 		};
 
 		// Cache temporário para forçar entrada em grupos bloqueados
 		this.forceJoinCache = new Map();
+
+		// Timer do modo silencioso global
+		this.silentModeTimer = null;
 	}
 
 	/**
@@ -663,6 +687,181 @@ Break down the cost by category and provide a total estimated cost.`;
 		}
 	}
 
+	/**
+	 * Entra em um grupo via link de convite, SEM enviar mensagem de boas-vindas
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @param {Array} args - Argumentos do comando
+	 * @returns {Promise<ReturnMessage>} - Retorna mensagem de sucesso ou erro
+	 */
+	async joinGroupSilent(bot, message, args) {
+		try {
+			const chatId = message.group ?? message.author;
+
+			// Verifica se o usuário é um super admin
+			if (!this.isSuperAdmin(message.author) && !this.isComuAdmin(bot, message.author)) {
+				return new ReturnMessage({
+					chatId,
+					content: "⛔ Apenas super administradores podem usar este comando."
+				});
+			}
+
+			if (args.length === 0) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"Por favor, forneça um código de convite. Exemplo: !sa-joinGrupoSilencioso abcd1234"
+				});
+			}
+
+			const inviteCode = args[0];
+
+			// Inicializa o set de joins silenciosos no bot (se ainda não existir)
+			if (!bot.silentJoinGroups) {
+				bot.silentJoinGroups = new Set();
+			}
+
+			// Busca as informações do grupo via invite code para obter o JID antes de entrar
+			let groupJid = null;
+			try {
+				const info = await bot.inviteInfo(inviteCode);
+				// A resposta tem a estrutura { JID, Name, ... }
+				groupJid = info?.JID ?? info?.data?.JID ?? null;
+				this.logger.info(
+					`[joinGroupSilent] Invite info para '${inviteCode}': JID=${groupJid}, Nome=${info?.Name ?? "?"}`
+				);
+			} catch (infoError) {
+				this.logger.warn(
+					`[joinGroupSilent] Não foi possível obter info do invite '${inviteCode}':`,
+					infoError
+				);
+			}
+
+			if (!groupJid) {
+				return new ReturnMessage({
+					chatId,
+					content: `❌ Não foi possível obter o ID do grupo a partir do código de convite '${inviteCode}'. Verifique se o link é válido.`
+				});
+			}
+
+			// Registra o JID na lista de joins silenciosos ANTES de entrar
+			bot.silentJoinGroups.add(groupJid);
+			this.logger.info(
+				`[joinGroupSilent] Grupo ${groupJid} adicionado à lista de silentJoinGroups. Entrando silenciosamente...`
+			);
+
+			try {
+				// Aceita o convite
+				const joinResult = await bot.client.acceptInvite(inviteCode);
+
+				if (joinResult.accepted) {
+					// Remove dos convites pendentes se existir
+					await this.database.removePendingJoin(inviteCode);
+
+					return new ReturnMessage({
+						chatId,
+						content: `✅ Entrou silenciosamente no grupo *${groupJid}* com código de convite ${inviteCode}\n🔇 _Nenhuma mensagem de boas-vindas será enviada._`
+					});
+				} else {
+					// Remove do set pois o join falhou
+					bot.silentJoinGroups.delete(groupJid);
+					const msgErro = joinResult.error ? `\n> ${joinResult.error}` : "";
+					return new ReturnMessage({
+						chatId,
+						content: `❌ Falha ao entrar no grupo com código de convite ${inviteCode}${msgErro}`
+					});
+				}
+			} catch (error) {
+				// Remove do set pois o join falhou
+				bot.silentJoinGroups.delete(groupJid);
+				this.logger.error("Erro ao aceitar convite de grupo (silencioso):", error);
+
+				return new ReturnMessage({
+					chatId,
+					content: `❌ Erro ao entrar no grupo: ${error.message}`
+				});
+			}
+		} catch (error) {
+			this.logger.error("Erro no comando joinGroupSilent:", error);
+
+			return new ReturnMessage({
+				chatId: message.group ?? message.author,
+				content: "❌ Erro ao processar comando."
+			});
+		}
+	}
+
+	/**
+	 * Toggle do modo silencioso global do bot (sem mensagens de boas-vindas por 30 min)
+	 * @param {WhatsAppBot} bot - Instância do bot
+	 * @param {Object} message - Dados da mensagem
+	 * @returns {Promise<ReturnMessage>} - Retorna mensagem de status
+	 */
+	async toggleSilentMode(bot, message) {
+		const chatId = message.group ?? message.author;
+
+		if (!this.isSuperAdmin(message.author)) {
+			return new ReturnMessage({
+				chatId,
+				content: "⛔ Apenas super administradores podem usar este comando."
+			});
+		}
+
+		const SILENT_DURATION_MS = 30 * 60 * 1000; // 30 minutos
+
+		if (bot.joinSilencioso) {
+			// Já está ativo — toggle para OFF
+			bot.joinSilencioso = false;
+			if (this.silentModeTimer) {
+				clearTimeout(this.silentModeTimer);
+				this.silentModeTimer = null;
+			}
+			this.logger.info(
+				`[toggleSilentMode] Modo silencioso global DESATIVADO para o bot '${bot.id}'.`
+			);
+			return new ReturnMessage({
+				chatId,
+				content: `🔊 Modo silencioso *desativado*. O bot voltará a enviar mensagens de boas-vindas normalmente.`
+			});
+		} else {
+			// Estava OFF — ativa por 30 minutos
+			bot.joinSilencioso = true;
+			this.logger.info(
+				`[toggleSilentMode] Modo silencioso global ATIVADO para o bot '${bot.id}' por 30 minutos.`
+			);
+
+			// Cancela timer anterior se houver (não deveria, mas por segurança)
+			if (this.silentModeTimer) {
+				clearTimeout(this.silentModeTimer);
+			}
+
+			this.silentModeTimer = setTimeout(() => {
+				bot.joinSilencioso = false;
+				this.silentModeTimer = null;
+				this.logger.info(
+					`[toggleSilentMode] Modo silencioso global EXPIROU automaticamente para o bot '${bot.id}'.`
+				);
+				// Notifica o chat que o modo expirou
+				bot
+					.sendMessage(
+						chatId,
+						`🔊 Modo silencioso *expirou* automaticamente. O bot voltará a enviar mensagens de boas-vindas normalmente.`
+					)
+					.catch(() => {});
+			}, SILENT_DURATION_MS);
+
+			const expiraEm = new Date(Date.now() + SILENT_DURATION_MS).toLocaleTimeString("pt-BR", {
+				hour: "2-digit",
+				minute: "2-digit"
+			});
+
+			return new ReturnMessage({
+				chatId,
+				content: `🔇 Modo silencioso *ativado* por 30 minutos (expira às ${expiraEm}).\n\nO bot *não* enviará mensagens de boas-vindas ao entrar em grupos. Use o comando novamente para desativar antes do tempo.`
+			});
+		}
+	}
+
 	formatPhoneNumber(phone) {
 		// Ensure only digits
 		const digits = phone.replace(/\D/g, "");
@@ -787,7 +986,7 @@ Break down the cost by category and provide a total estimated cost.`;
 				let cttDonate = await bot.createContact(numero);
 
 				if (!cttDonate) {
-					cttDonate = `${donorName} apoiador ravenabot`;
+					cttDonate = `${donorName} apoiador ${bot.nomeExibir || "ravenabot"}`;
 				}
 
 				this.logger.debug("[cttDonate]", cttDonate);
@@ -1133,16 +1332,25 @@ Break down the cost by category and provide a total estimated cost.`;
 				});
 			}
 
-			if (args.length === 0) {
+			let mode = "both";
+			let numberArgs = args;
+			if (args[0] === "local" || args[0] === "whats") {
+				mode = args[0];
+				numberArgs = args.slice(1);
+			}
+
+			if (numberArgs.length === 0) {
 				return new ReturnMessage({
 					chatId,
 					content:
-						"Por favor, forneça um número de telefone para bloquear. Exemplo: !sa-block +5511999999999"
+						"Por favor, forneça um número de telefone para bloquear. Exemplo: !sa-block " +
+						(mode !== "both" ? mode + " " : "") +
+						"+5511999999999"
 				});
 			}
 
 			// Processa o número para formato padrão (apenas dígitos)
-			let phoneNumber = args.join(" ").replace(/\D/g, "");
+			let phoneNumber = numberArgs.join(" ").replace(/\D/g, "");
 
 			// Se o número não tiver o formato @c.us, adicione
 			if (!phoneNumber.includes("@")) {
@@ -1160,7 +1368,7 @@ Break down the cost by category and provide a total estimated cost.`;
 			try {
 				// Tenta remover o contato de grupos especiais primeiro
 				let removeResults = {};
-				if (specialGroups.length > 0) {
+				if (specialGroups.length > 0 && (mode === "both" || mode === "whats")) {
 					removeResults = await this.removeFromSpecialGroups(
 						bot,
 						phoneNumber,
@@ -1176,23 +1384,31 @@ Break down the cost by category and provide a total estimated cost.`;
 				let localStatus = "";
 
 				// 1. Tenta bloquear o contato na API externa
-				try {
-					const contatoBloquear = await bot.client.getContactById(phoneNumber);
-					await contatoBloquear.block();
-					apiStatus = "✅ API (Sucesso)";
-				} catch (blockError) {
-					this.logger.error("Erro ao bloquear contato na API:", blockError);
-					apiStatus = `❌ API (${blockError.message})`;
+				if (mode === "both" || mode === "whats") {
+					try {
+						const contatoBloquear = await bot.client.getContactById(phoneNumber);
+						await contatoBloquear.block();
+						apiStatus = "✅ API (Sucesso)";
+					} catch (blockError) {
+						this.logger.error("Erro ao bloquear contato na API:", blockError);
+						apiStatus = `❌ API (${blockError.message})`;
+					}
+				} else {
+					apiStatus = "⏭️ API (Ignorado)";
 				}
 
 				// 2. Tenta bloquear o contato localmente
-				try {
-					const pnClean = phoneNumber.split("@")[0];
-					await this.database.addLocalBlock(pnClean);
-					localStatus = "✅ Local (Sucesso)";
-				} catch (localError) {
-					this.logger.error("Erro ao bloquear contato localmente:", localError);
-					localStatus = `❌ Local (${localError.message})`;
+				if (mode === "both" || mode === "local") {
+					try {
+						const pnClean = phoneNumber.split("@")[0];
+						await this.database.addLocalBlock(pnClean);
+						localStatus = "✅ Local (Sucesso)";
+					} catch (localError) {
+						this.logger.error("Erro ao bloquear contato localmente:", localError);
+						localStatus = `❌ Local (${localError.message})`;
+					}
+				} else {
+					localStatus = "⏭️ Local (Ignorado)";
 				}
 
 				// Cria a resposta
@@ -1238,16 +1454,25 @@ Break down the cost by category and provide a total estimated cost.`;
 				});
 			}
 
-			if (args.length === 0) {
+			let mode = "both";
+			let numberArgs = args;
+			if (args[0] === "local" || args[0] === "whats") {
+				mode = args[0];
+				numberArgs = args.slice(1);
+			}
+
+			if (numberArgs.length === 0) {
 				return new ReturnMessage({
 					chatId,
 					content:
-						"Por favor, forneça um número de telefone para desbloquear. Exemplo: !sa-unblock +5511999999999"
+						"Por favor, forneça um número de telefone para desbloquear. Exemplo: !sa-unblock " +
+						(mode !== "both" ? mode + " " : "") +
+						"+5511999999999"
 				});
 			}
 
 			// Processa o número para formato padrão (apenas dígitos)
-			let phoneNumber = args.join(" ").replace(/\D/g, "");
+			let phoneNumber = numberArgs.join(" ").replace(/\D/g, "");
 
 			// Se o número não tiver o formato @c.us, adicione
 			if (!phoneNumber.includes("@")) {
@@ -1259,23 +1484,43 @@ Break down the cost by category and provide a total estimated cost.`;
 				let localStatus = "";
 
 				// 1. Tenta desbloquear o contato na API externa
-				try {
-					const contatoDesbloquear = await bot.client.getContactById(phoneNumber);
-					await contatoDesbloquear.unblock();
-					apiStatus = "✅ API (Sucesso)";
-				} catch (unblockError) {
-					this.logger.error("Erro ao desbloquear contato na API:", unblockError);
-					apiStatus = `❌ API (${unblockError.message})`;
+				let contact = null;
+				if (mode === "both" || mode === "whats") {
+					try {
+						contact = await bot.client.getContactById(phoneNumber);
+						await contact.unblock();
+						apiStatus = "✅ API (Sucesso)";
+					} catch (unblockError) {
+						this.logger.error("Erro ao desbloquear contato na API:", unblockError);
+						apiStatus = `❌ API (${unblockError.message})`;
+					}
+				} else {
+					apiStatus = "⏭️ API (Ignorado)";
 				}
 
 				// 2. Tenta desbloquear o contato localmente
-				try {
-					const pnClean = phoneNumber.split("@")[0];
-					await this.database.removeLocalBlock(pnClean);
-					localStatus = "✅ Local (Sucesso)";
-				} catch (localError) {
-					this.logger.error("Erro ao desbloquear contato localmente:", localError);
-					localStatus = `❌ Local (${localError.message})`;
+				if (mode === "both" || mode === "local") {
+					try {
+						const pnClean = phoneNumber.split("@")[0];
+						await this.database.removeLocalBlock(pnClean);
+						if (!contact && (mode === "both" || mode === "local")) {
+							try {
+								contact = await bot.client.getContactById(phoneNumber);
+							} catch (e) {}
+						}
+						if (contact && contact.lid) {
+							const lidClean = contact.lid.split("@")[0];
+							if (lidClean && lidClean !== pnClean) {
+								await this.database.removeLocalBlock(lidClean);
+							}
+						}
+						localStatus = "✅ Local (Sucesso)";
+					} catch (localError) {
+						this.logger.error("Erro ao desbloquear contato localmente:", localError);
+						localStatus = `❌ Local (${localError.message})`;
+					}
+				} else {
+					localStatus = "⏭️ Local (Ignorado)";
 				}
 
 				// Cria a resposta
@@ -1340,7 +1585,9 @@ Break down the cost by category and provide a total estimated cost.`;
 			} else {
 				// Busca o grupo pelo nome
 				const groups = await this.database.getGroups();
-				const group = groups.find((g) => g.name.toLowerCase() === groupIdentifier.toLowerCase());
+				const group = groups.find(
+					(g) => g.name.trim().toLowerCase() === groupIdentifier.trim().toLowerCase()
+				);
 
 				if (!group) {
 					return new ReturnMessage({
@@ -1955,18 +2202,26 @@ Break down the cost by category and provide a total estimated cost.`;
 				});
 			}
 
-			// Obtém o texto completo de argumentos e divide por vírgulas
-			const contactsText = args.join(" ");
-			if (!contactsText.trim()) {
+			let mode = "both";
+			let numbersText = args.join(" ");
+
+			if (args[0] === "local" || args[0] === "whats") {
+				mode = args[0];
+				numbersText = args.slice(1).join(" ");
+			}
+
+			if (!numbersText.trim()) {
 				return new ReturnMessage({
 					chatId,
 					content:
-						"Por favor, forneça uma lista de contatos separados por vírgula. Exemplo: !sa-blockList 5511999999999@c.us, 5511888888888@c.us"
+						"Por favor, forneça uma lista de contatos separados por vírgula. Exemplo: !sa-blockList " +
+						(mode !== "both" ? mode + " " : "") +
+						"5511999999999@c.us, 5511888888888@c.us"
 				});
 			}
 
 			// Divide a lista de contatos por vírgula
-			const contactsList = contactsText.split(",").map((contact) => contact.trim());
+			const contactsList = numbersText.split(",").map((contact) => contact.trim());
 
 			if (contactsList.length === 0) {
 				return new ReturnMessage({
@@ -2007,7 +2262,7 @@ Break down the cost by category and provide a total estimated cost.`;
 
 				try {
 					// Tenta remover o contato de grupos especiais primeiro
-					if (specialGroups.length > 0) {
+					if (specialGroups.length > 0 && (mode === "both" || mode === "whats")) {
 						const removeResults = await this.removeFromSpecialGroups(
 							bot,
 							phoneNumber,
@@ -2023,30 +2278,43 @@ Break down the cost by category and provide a total estimated cost.`;
 					let localError = "";
 
 					// 1. Tenta bloquear o contato na API externa
-					try {
-						const contact = await bot.client.getContactById(phoneNumber);
-						await contact.block();
+					if (mode === "both" || mode === "whats") {
+						try {
+							const contact = await bot.client.getContactById(phoneNumber);
+							await contact.block();
+							apiOk = true;
+						} catch (blockError) {
+							this.logger.error(`Erro ao bloquear contato ${phoneNumber} na API:`, blockError);
+							apiError = blockError.message ?? "Erro API";
+						}
+					} else {
 						apiOk = true;
-					} catch (blockError) {
-						this.logger.error(`Erro ao bloquear contato ${phoneNumber} na API:`, blockError);
-						apiError = blockError.message ?? "Erro API";
 					}
 
 					// 2. Tenta bloquear o contato localmente
-					try {
-						const pnClean = phoneNumber.split("@")[0];
-						await this.database.addLocalBlock(pnClean);
+					if (mode === "both" || mode === "local") {
+						try {
+							const pnClean = phoneNumber.split("@")[0];
+							await this.database.addLocalBlock(pnClean);
+							localOk = true;
+						} catch (dbError) {
+							this.logger.error(`Erro ao bloquear contato ${phoneNumber} localmente:`, dbError);
+							localError = dbError.message ?? "Erro Local";
+						}
+					} else {
 						localOk = true;
-					} catch (dbError) {
-						this.logger.error(`Erro ao bloquear contato ${phoneNumber} localmente:`, dbError);
-						localError = dbError.message ?? "Erro Local";
 					}
 
 					if (apiOk && localOk) {
+						let successMsg = "Sucesso";
+						if (mode === "local") successMsg += " (Local apenas)";
+						else if (mode === "whats") successMsg += " (API apenas)";
+						else successMsg += " (API & Local)";
+
 						results.push({
 							id: phoneNumber,
 							status: "Bloqueado",
-							message: "Sucesso (API & Local)"
+							message: successMsg
 						});
 					} else {
 						let statusMsg = "";
@@ -2238,7 +2506,13 @@ Break down the cost by category and provide a total estimated cost.`;
 							const groupName = chat.name ?? groupId;
 
 							// Verifica se é um grupo especial
-							const isSpecialGroup = specialGroups.includes(groupId);
+							const nameLower = groupName ? groupName.toLowerCase() : "";
+							const isSpecialGroup =
+								specialGroups.includes(groupId) ||
+								(groupName &&
+									(nameLower.includes("gpzuera") ||
+										nameLower.includes("rapescas") ||
+										nameLower.includes("ravdownloads")));
 
 							if (isSpecialGroup) {
 								this.logger.info(
@@ -2478,18 +2752,26 @@ Break down the cost by category and provide a total estimated cost.`;
 				});
 			}
 
-			// Obtém o texto completo de argumentos e divide por vírgulas
-			const contactsText = args.join(" ");
-			if (!contactsText.trim()) {
+			let mode = "both";
+			let numbersText = args.join(" ");
+
+			if (args[0] === "local" || args[0] === "whats") {
+				mode = args[0];
+				numbersText = args.slice(1).join(" ");
+			}
+
+			if (!numbersText.trim()) {
 				return new ReturnMessage({
 					chatId,
 					content:
-						"Por favor, forneça uma lista de contatos separados por vírgula. Exemplo: !sa-unblockList 5511999999999@c.us, 5511888888888@c.us"
+						"Por favor, forneça uma lista de contatos separados por vírgula. Exemplo: !sa-unblockList " +
+						(mode !== "both" ? mode + " " : "") +
+						"5511999999999@c.us, 5511888888888@c.us"
 				});
 			}
 
 			// Divide a lista de contatos por vírgula
-			const contactsList = contactsText.split(",").map((contact) => contact.trim());
+			const contactsList = numbersText.split(",").map((contact) => contact.trim());
 
 			if (contactsList.length === 0) {
 				return new ReturnMessage({
@@ -2526,23 +2808,43 @@ Break down the cost by category and provide a total estimated cost.`;
 					let localError = "";
 
 					// 1. Tenta desbloquear o contato na API externa
-					try {
-						const contact = await bot.client.getContactById(phoneNumber);
-						await contact.unblock();
+					let contact = null;
+					if (mode === "both" || mode === "whats") {
+						try {
+							contact = await bot.client.getContactById(phoneNumber);
+							await contact.unblock();
+							apiOk = true;
+						} catch (unblockError) {
+							this.logger.error(`Erro ao desbloquear contato ${phoneNumber} na API:`, unblockError);
+							apiError = unblockError.message ?? "Erro API";
+						}
+					} else {
 						apiOk = true;
-					} catch (unblockError) {
-						this.logger.error(`Erro ao desbloquear contato ${phoneNumber} na API:`, unblockError);
-						apiError = unblockError.message ?? "Erro API";
 					}
 
 					// 2. Tenta desbloquear o contato localmente
-					try {
-						const pnClean = phoneNumber.split("@")[0];
-						await this.database.removeLocalBlock(pnClean);
+					if (mode === "both" || mode === "local") {
+						try {
+							const pnClean = phoneNumber.split("@")[0];
+							await this.database.removeLocalBlock(pnClean);
+							if (!contact && (mode === "both" || mode === "local")) {
+								try {
+									contact = await bot.client.getContactById(phoneNumber);
+								} catch (e) {}
+							}
+							if (contact && contact.lid) {
+								const lidClean = contact.lid.split("@")[0];
+								if (lidClean && lidClean !== pnClean) {
+									await this.database.removeLocalBlock(lidClean);
+								}
+							}
+							localOk = true;
+						} catch (dbError) {
+							this.logger.error(`Erro ao desbloquear contato ${phoneNumber} localmente:`, dbError);
+							localError = dbError.message ?? "Erro Local";
+						}
+					} else {
 						localOk = true;
-					} catch (dbError) {
-						this.logger.error(`Erro ao desbloquear contato ${phoneNumber} localmente:`, dbError);
-						localError = dbError.message ?? "Erro Local";
 					}
 
 					if (apiOk && localOk) {
@@ -2788,7 +3090,13 @@ Break down the cost by category and provide a total estimated cost.`;
 						const groupName = chat.name ?? groupId;
 
 						// Verifica se é um grupo especial
-						const isSpecialGroup = specialGroups.includes(groupId);
+						const nameLower = groupName ? groupName.toLowerCase() : "";
+						const isSpecialGroup =
+							specialGroups.includes(groupId) ||
+							(groupName &&
+								(nameLower.includes("gpzuera") ||
+									nameLower.includes("rapescas") ||
+									nameLower.includes("ravdownloads")));
 
 						if (isSpecialGroup) {
 							this.logger.info(
@@ -3007,8 +3315,8 @@ Break down the cost by category and provide a total estimated cost.`;
 			const allExistingNames = new Set(groups.map((g) => g.name.toLowerCase()));
 
 			for (const group of groups) {
-				const isNumeric = /^\d+$/.test(group.name);
-				if (group.name.length > 15) {
+				const isNumeric = /^\d+$/.test(group.name.trim());
+				if (group.name.trim().length > 30) {
 					toFixLength.push(group);
 				} else if (isNumeric) {
 					toFixNumeric.push(group);
@@ -3056,11 +3364,11 @@ Break down the cost by category and provide a total estimated cost.`;
 					}
 
 					// Ensure uniqueness
-					const baseName = newName.substring(0, 12);
+					const baseName = newName.substring(0, 25);
 					let counter = 1;
-					let finalName = newName.substring(0, 15);
+					let finalName = newName.substring(0, 30);
 					while (allExistingNames.has(finalName.toLowerCase())) {
-						finalName = `${baseName}${counter}`.substring(0, 15);
+						finalName = `${baseName}${counter}`.substring(0, 30);
 						counter++;
 					}
 					allExistingNames.add(finalName.toLowerCase());
@@ -3080,7 +3388,7 @@ Break down the cost by category and provide a total estimated cost.`;
 			// Handle Long Names in batch
 			if (toFixLength.length > 0) {
 				const longNamesList = toFixLength.map((g) => `- ${g.name} (${g.id})`).join("\n");
-				const prompt = `Sugira nomes curtos (máximo 15 caracteres) para os seguintes grupos de WhatsApp. 
+				const prompt = `Sugira nomes curtos (máximo 30 caracteres) para os seguintes grupos de WhatsApp. 
 Use TitleCase, remova acentos e espaços. Os nomes devem ser únicos e descritivos.
 Se o nome atual já for descritivo, tente apenas encurtá-lo mantendo o sentido.
 
@@ -3134,11 +3442,11 @@ Retorne no formato JSON rigoroso:
 								const suggestedName = sanitize(sugg.newName);
 
 								// Ensure uniqueness and length
-								const baseName = suggestedName.substring(0, 12);
+								const baseName = suggestedName.substring(0, 25);
 								let counter = 1;
-								let finalName = suggestedName.substring(0, 15);
+								let finalName = suggestedName.substring(0, 30);
 								while (allExistingNames.has(finalName.toLowerCase())) {
-									finalName = `${baseName}${counter}`.substring(0, 15);
+									finalName = `${baseName}${counter}`.substring(0, 30);
 									counter++;
 								}
 								allExistingNames.add(finalName.toLowerCase());
@@ -3248,11 +3556,11 @@ Retorne no formato JSON rigoroso:
 			}
 
 			// Obtém nome do grupo a partir dos argumentos
-			const groupName = args.join(" ").toLowerCase();
+			const groupName = args.join(" ").trim().toLowerCase();
 
 			// Busca o grupo no banco de dados
 			const groups = await this.database.getGroups();
-			const group = groups.find((g) => g.name.toLowerCase() === groupName);
+			const group = groups.find((g) => g.name.trim().toLowerCase() === groupName);
 
 			if (!group) {
 				return new ReturnMessage({
@@ -3466,6 +3774,222 @@ Retorne no formato JSON rigoroso:
 			return new ReturnMessage({
 				chatId,
 				content: `❌ Erro: ${error.message}`
+			});
+		}
+	}
+
+	/**
+	 * Força checkpoint de WAL em disco e valida a integridade de todos os bancos de dados
+	 */
+	async dumpDbs(bot, message, args) {
+		const chatId = message.group ?? message.author;
+		try {
+			if (!this.isSuperAdmin(message.author)) return;
+
+			await bot.sendMessage(
+				chatId,
+				"⏳ Iniciando checkpoint de WAL e verificação de integridade em todos os bancos de dados..."
+			);
+
+			const sqlitesDir = path.join(this.dataPath, "sqlites");
+			if (!require("fs").existsSync(sqlitesDir)) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ Pasta 'sqlites' não existe localmente."
+				});
+			}
+
+			const files = require("fs").readdirSync(sqlitesDir);
+			const dbFiles = files.filter((f) => f.endsWith(".db") && f !== "cooldowns.db");
+
+			const results = [];
+			const BetterSQLite = require("better-sqlite3");
+
+			for (const dbFile of dbFiles) {
+				const dbName = dbFile.replace(".db", "");
+				const dbPath = path.join(sqlitesDir, dbFile);
+				let conn = null;
+				let wasOpen = false;
+
+				try {
+					// 1. Obter ou abrir conexão
+					if (this.database.mappers && this.database.mappers.connections[dbName]) {
+						conn = this.database.mappers.connections[dbName];
+						wasOpen = true;
+					} else {
+						conn = new BetterSQLite(dbPath);
+						wasOpen = false;
+					}
+
+					// 2. Executar Checkpoint (forçar mesclagem de WAL em disco)
+					conn.pragma("wal_checkpoint(TRUNCATE)");
+
+					// 3. Executar Integrity Check
+					const integrityRows = conn.pragma("integrity_check");
+					const isOk =
+						Array.isArray(integrityRows) &&
+						integrityRows.length === 1 &&
+						integrityRows[0].integrity_check === "ok";
+
+					results.push({
+						name: dbFile,
+						checkpoint: "OK",
+						integrity: isOk ? "SAUDÁVEL" : `CORROMPIDO (${JSON.stringify(integrityRows)})`
+					});
+
+					// Fechar conexão se abrimos temporariamente
+					if (!wasOpen) {
+						conn.close();
+					}
+				} catch (err) {
+					results.push({
+						name: dbFile,
+						checkpoint: "ERRO",
+						integrity: `FALHA AO ABRIR/EXECUTAR (${err.message})`
+					});
+				}
+			}
+
+			// Formata relatório final
+			let response = "📊 *Relatório do Dump de Bancos de Dados*\n\n";
+			let hasError = false;
+
+			results.forEach((res) => {
+				const statusIcon = res.integrity === "SAUDÁVEL" ? "🟢" : "🔴";
+				response += `${statusIcon} *${res.name}*:\n`;
+				response += `  - Checkpoint (WAL): ${res.checkpoint}\n`;
+				response += `  - Integridade: ${res.integrity}\n\n`;
+				if (res.integrity !== "SAUDÁVEL") {
+					hasError = true;
+				}
+			});
+
+			if (hasError) {
+				response +=
+					"⚠️ *Atenção:* Foram detectados problemas de integridade em alguns bancos de dados!";
+			} else {
+				response += "✅ Todos os bancos de dados foram gravados em disco e estão saudáveis!";
+			}
+
+			return new ReturnMessage({
+				chatId,
+				content: response
+			});
+		} catch (error) {
+			this.logger.error("Erro no comando dumpDbs:", error);
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Erro geral ao executar dump e verificação: ${error.message}`
+			});
+		}
+	}
+
+	async removeUserGp(bot, message, args) {
+		const chatId = message.group ?? message.author;
+		try {
+			if (!this.isSuperAdmin(message.author)) {
+				return new ReturnMessage({
+					chatId,
+					content: "⛔ Apenas super administradores podem usar este comando."
+				});
+			}
+
+			if (args.length < 2) {
+				return new ReturnMessage({
+					chatId,
+					content: "Uso incorreto. Exemplo: !sa-removeUserGp 123456789@g.us 55999999999"
+				});
+			}
+
+			let groupJid = args[0].trim();
+			let targetJid = args[1].trim();
+
+			// Normaliza groupJid se necessário
+			if (!groupJid.endsWith("@g.us")) {
+				groupJid = `${groupJid.split("@")[0]}@g.us`;
+			}
+
+			// Normaliza targetJid
+			if (!targetJid.includes("@")) {
+				targetJid = `${targetJid.replace(/\D/g, "")}@s.whatsapp.net`;
+			}
+
+			// Tenta buscar o chat
+			const chat = await bot.client.getChatById(groupJid);
+			if (!chat || chat.notInGroup) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ Grupo não encontrado ou o bot não está nele."
+				});
+			}
+
+			// Tenta remover
+			await chat.removeParticipants([targetJid]);
+
+			return new ReturnMessage({
+				chatId,
+				content: `✅ Solicitação de remoção de '${targetJid}' do grupo '${groupJid}' enviada com sucesso.`
+			});
+		} catch (error) {
+			this.logger.error("Erro no comando removeUserGp:", error);
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Erro ao remover usuário: ${error.message || JSON.stringify(error)}`
+			});
+		}
+	}
+
+	async addUserGp(bot, message, args) {
+		const chatId = message.group ?? message.author;
+		try {
+			if (!this.isSuperAdmin(message.author)) {
+				return new ReturnMessage({
+					chatId,
+					content: "⛔ Apenas super administradores podem usar este comando."
+				});
+			}
+
+			if (args.length < 2) {
+				return new ReturnMessage({
+					chatId,
+					content: "Uso incorreto. Exemplo: !sa-addUserGp 123456789@g.us 55999999999"
+				});
+			}
+
+			let groupJid = args[0].trim();
+			let targetJid = args[1].trim();
+
+			// Normaliza groupJid se necessário
+			if (!groupJid.endsWith("@g.us")) {
+				groupJid = `${groupJid.split("@")[0]}@g.us`;
+			}
+
+			// Normaliza targetJid
+			if (!targetJid.includes("@")) {
+				targetJid = `${targetJid.replace(/\D/g, "")}@s.whatsapp.net`;
+			}
+
+			// Tenta buscar o chat
+			const chat = await bot.client.getChatById(groupJid);
+			if (!chat || chat.notInGroup) {
+				return new ReturnMessage({
+					chatId,
+					content: "❌ Grupo não encontrado ou o bot não está nele."
+				});
+			}
+
+			// Tenta adicionar
+			await chat.addParticipants([targetJid]);
+
+			return new ReturnMessage({
+				chatId,
+				content: `✅ Solicitação de adição de '${targetJid}' no grupo '${groupJid}' enviada com sucesso.`
+			});
+		} catch (error) {
+			this.logger.error("Erro no comando addUserGp:", error);
+			return new ReturnMessage({
+				chatId,
+				content: `❌ Erro ao adicionar usuário: ${error.message || JSON.stringify(error)}`
 			});
 		}
 	}

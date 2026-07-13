@@ -1,4 +1,4 @@
-﻿const path = require("path");
+const path = require("path");
 const axios = require("axios");
 const Logger = require("../utils/Logger");
 const ytSearch = require("youtube-search-api");
@@ -14,6 +14,59 @@ const fs = require("fs").promises;
 const logger = new Logger("youtube-downloader");
 const database = Database.getInstance();
 const videoCacheManager = new VideoCacheManager(youtubedl, database.databasePath);
+
+// === Rotação de cliente yt-dlp para evitar rate limit ===
+const YT_CLIENTS = ["default", "ios", "android", "mweb"];
+let currentClientIndex = 0;
+
+function getCurrentClientArgs() {
+	const client = YT_CLIENTS[currentClientIndex];
+	return client === "default" ? {} : { extractorArgs: `youtube:player_client=${client}` };
+}
+
+function advanceClient() {
+	const prev = YT_CLIENTS[currentClientIndex];
+	currentClientIndex = (currentClientIndex + 1) % YT_CLIENTS.length;
+	logger.warn(
+		`[clientRotation] Rate limit no cliente '${prev}', tentando '${YT_CLIENTS[currentClientIndex]}'`
+	);
+}
+
+function isRateLimitError(error) {
+	const msg = (error?.message || error?.stderr || String(error)).toLowerCase();
+	return (
+		msg.includes("429") ||
+		msg.includes("too many requests") ||
+		msg.includes("sign in to confirm") ||
+		msg.includes("403")
+	);
+}
+
+async function downloadWithRetry(urlSafe, baseOptions, type = "video") {
+	let lastError;
+	for (let attempt = 0; attempt < YT_CLIENTS.length; attempt++) {
+		const clientName = YT_CLIENTS[currentClientIndex];
+		const options = { ...baseOptions, ...getCurrentClientArgs() };
+		try {
+			logger.info(
+				`[clientRotation] Download com cliente '${clientName}' (tentativa ${attempt + 1}/${YT_CLIENTS.length})`
+			);
+			if (type === "audio") {
+				return await videoCacheManager.downloadMusicWithCache(urlSafe, options);
+			} else {
+				return await videoCacheManager.downloadVideoWithCache(urlSafe, options);
+			}
+		} catch (err) {
+			if (isRateLimitError(err)) {
+				advanceClient();
+				lastError = err;
+			} else {
+				throw err;
+			}
+		}
+	}
+	throw lastError;
+}
 
 //logger.info('Módulo YoutubeDownloader carregado');
 
@@ -234,7 +287,7 @@ async function baixarVideoYoutube(idVideo, dadosSolicitante, videoHD = false, ca
 				...(process.env.YT_USE_COOKIES === "true"
 					? { cookies: path.join(database.databasePath, "www.youtube.com_cookies.txt") }
 					: {}),
-				"js-runtimes": "node"
+				jsRuntimes: "node"
 			})
 			.then((videoInfo) => {
 				const autorVideo = videoInfo.uploader;
@@ -249,19 +302,17 @@ async function baixarVideoYoutube(idVideo, dadosSolicitante, videoHD = false, ca
 						null
 					);
 				} else {
-					videoCacheManager
-						.downloadVideoWithCache(urlSafe, {
-							o: destinoVideo,
-							f: "(bv*[vcodec~='^((he|a)vc|h264)'][filesize<60M]+ba) / (bv*+ba/b)",
-							remuxVideo: "mp4",
-							recodeVideo: "mp4",
-							audioFormat: "aac",
-							ffmpegLocation: process.env.FFMPEG_PATH,
-							...(process.env.YT_USE_COOKIES === "true"
-								? { cookies: path.join(database.databasePath, "www.youtube.com_cookies.txt") }
-								: {}),
-							"js-runtimes": "node"
-						})
+					downloadWithRetry(urlSafe, {
+						o: destinoVideo,
+						f: "(bv*[vcodec~='^(avc|h264)'][filesize<60M]+ba) / (bv*+ba/b)",
+						remuxVideo: "mp4",
+						audioFormat: "aac",
+						ffmpegLocation: process.env.FFMPEG_PATH,
+						...(process.env.YT_USE_COOKIES === "true"
+							? { cookies: path.join(database.databasePath, "www.youtube.com_cookies.txt") }
+							: {}),
+						jsRuntimes: "node"
+					})
 						.then((output) => {
 							if (output.fromCache) {
 								logger.info(`[baixarVideoYoutube][${nomeVideoTemp}] Estava em cache!`);
@@ -296,7 +347,6 @@ async function baixarVideoYoutube(idVideo, dadosSolicitante, videoHD = false, ca
 async function baixarMusicaYoutube(idVideo, dadosSolicitante, callback) {
 	const hash = crypto.randomBytes(2).toString("hex");
 	const nomeVideoTemp = `ytdlp-${hash}`;
-	const tempVideoPath = path.join(process.env.DL_FOLDER, `${nomeVideoTemp}_v.mp4`);
 
 	try {
 		idVideo = idVideo.replace(/[^a-z0-9_-]/gi, "");
@@ -310,9 +360,9 @@ async function baixarMusicaYoutube(idVideo, dadosSolicitante, callback) {
 				...(process.env.YT_USE_COOKIES === "true"
 					? { cookies: path.join(database.databasePath, "www.youtube.com_cookies.txt") }
 					: {}),
-				"js-runtimes": "node"
+				jsRuntimes: "node"
 			})
-			.then((videoInfo) => {
+			.then(async (videoInfo) => {
 				const autorVideo = videoInfo.uploader;
 				const tituloVideo = videoInfo.title;
 				logger.info(
@@ -326,68 +376,39 @@ async function baixarMusicaYoutube(idVideo, dadosSolicitante, callback) {
 					);
 				}
 
-				logger.info(
-					`[baixarMusicaYoutube][${nomeVideoTemp}] Fazendo download do vídeo para conversão...`
-				);
+				const outputDir = path.join(__dirname, "..", "..", "public", "audios");
+				await fs.mkdir(outputDir, { recursive: true });
+				const outputFileName = `${crypto.randomUUID()}.mp3`;
+				const destinoMp3 = path.join(outputDir, outputFileName);
+
+				logger.info(`[baixarMusicaYoutube][${nomeVideoTemp}] Fazendo download do áudio...`);
 				const downloadOptions = {
-					o: tempVideoPath,
-					f: "(bv*[vcodec~='^((he|a)vc|h264)'][filesize<60M]+ba) / (bv*+ba/b)",
-					remuxVideo: "mp4",
-					recodeVideo: "mp4",
-					audioFormat: "aac",
+					o: destinoMp3,
+					f: "ba",
+					extractAudio: true,
+					audioFormat: "mp3",
 					ffmpegLocation: process.env.FFMPEG_PATH,
 					...(process.env.YT_USE_COOKIES === "true"
 						? { cookies: path.join(database.databasePath, "www.youtube.com_cookies.txt") }
 						: {}),
-					"js-runtimes": "node"
+					jsRuntimes: "node"
 				};
 
-				videoCacheManager
-					.downloadVideoWithCache(urlSafe, downloadOptions)
-					.then((output) => {
-						let videoToConvertPath;
-						let shouldCleanup = false;
+				downloadWithRetry(urlSafe, downloadOptions, "audio")
+					.then(async (output) => {
+						let audioFilePath;
 
 						if (output.fromCache) {
 							logger.info(
-								`[baixarMusicaYoutube][${nomeVideoTemp}] Vídeo estava em cache: ${output.lastDownloadLocation}`
+								`[baixarMusicaYoutube][${nomeVideoTemp}] Áudio estava em cache: ${output.lastDownloadLocation}`
 							);
-							videoToConvertPath = output.lastDownloadLocation;
+							audioFilePath = output.lastDownloadLocation;
 						} else {
 							logger.info(
-								`[baixarMusicaYoutube][${nomeVideoTemp}] Vídeo baixado para: ${tempVideoPath}`
+								`[baixarMusicaYoutube][${nomeVideoTemp}] Áudio baixado e convertido para: ${destinoMp3}`
 							);
-							videoToConvertPath = tempVideoPath;
-							shouldCleanup = true;
-							videoCacheManager.setLastDownloadLocation(urlSafe, videoToConvertPath, "video");
-						}
-
-						logger.info(
-							`[baixarMusicaYoutube][${nomeVideoTemp}] Convertendo '${videoToConvertPath}' para MP3...`
-						);
-						return toMp3(videoToConvertPath).then((audioFilePath) => ({
-							audioFilePath,
-							shouldCleanup,
-							videoToConvertPath
-						}));
-					})
-					.then(({ audioFilePath, shouldCleanup, videoToConvertPath }) => {
-						logger.info(
-							`[baixarMusicaYoutube][${nomeVideoTemp}] Conversão para MP3 concluída: ${audioFilePath}`
-						);
-
-						if (shouldCleanup) {
-							fs.unlink(videoToConvertPath)
-								.then(() =>
-									logger.info(
-										`[baixarMusicaYoutube][${nomeVideoTemp}] Arquivo de vídeo temporário removido: ${videoToConvertPath}`
-									)
-								)
-								.catch((err) =>
-									logger.warn(
-										`[baixarMusicaYoutube][${nomeVideoTemp}] Falha ao remover arquivo de vídeo temporário: ${err}`
-									)
-								);
+							audioFilePath = destinoMp3;
+							await videoCacheManager.setLastDownloadLocation(urlSafe, audioFilePath, "audio");
 						}
 
 						const resultado = { legenda: `[${autorVideo}] ${tituloVideo}`, arquivo: audioFilePath };
@@ -804,45 +825,74 @@ async function lyricsCommand(bot, message, args, group) {
 	});
 }
 
+async function downloadsDisabledCommand(bot, message, args, group) {
+	const chatId = message.group ?? message.author;
+	return new ReturnMessage({
+		chatId,
+		content:
+			"⚠️ *Downloads temporariamente desabilitados!* ⚠️\n\nEsta funcionalidade está em manutenção e voltará em breve. Agradecemos a compreensão! ✨"
+	});
+}
+
+const disableDownloads = process.env.DISABLE_DOWNLOADS && process.env.DISABLE_DOWNLOADS !== "false";
+
 // Comandos utilizando a classe Command
 const commands = [
 	new Command({
 		name: "yt",
 		caseSensitive: false,
 		description: "Baixa um vídeo do YouTube",
-		category: "utilidades",
-		reactions: {
-			before: process.env.LOADING_EMOJI ?? "⌛️",
-			after: "✅",
-			error: "❌"
-		},
-		method: ytCommand
+		category: "downloaders",
+		reactions: disableDownloads
+			? {
+					before: null,
+					after: "⚠️",
+					error: "❌"
+				}
+			: {
+					before: process.env.LOADING_EMOJI ?? "⌛️",
+					after: "✅",
+					error: "❌"
+				},
+		method: disableDownloads ? downloadsDisabledCommand : ytCommand
 	}),
 
 	new Command({
 		name: "sr",
 		caseSensitive: false,
 		description: "Baixa uma música do YouTube (áudio do vídeo)",
-		category: "utilidades",
-		reactions: {
-			before: process.env.LOADING_EMOJI ?? "⌛️",
-			after: "✅",
-			error: "❌"
-		},
-		method: srCommand
+		category: "downloaders",
+		reactions: disableDownloads
+			? {
+					before: null,
+					after: "⚠️",
+					error: "❌"
+				}
+			: {
+					before: process.env.LOADING_EMOJI ?? "⌛️",
+					after: "✅",
+					error: "❌"
+				},
+		method: disableDownloads ? downloadsDisabledCommand : srCommand
 	}),
 
 	new Command({
 		name: "letra",
 		caseSensitive: false,
 		description: "Busca a letra de uma música",
-		category: "utilidades",
-		reactions: {
-			before: process.env.LOADING_EMOJI ?? "⌛️",
-			after: "🎶",
-			error: "❌"
-		},
-		method: lyricsCommand
+		category: "downloaders",
+		reactions: disableDownloads
+			? {
+					before: null,
+					after: "⚠️",
+					error: "❌"
+				}
+			: {
+					before: process.env.LOADING_EMOJI ?? "⌛️",
+					after: "🎶",
+					error: "❌"
+				},
+		method: disableDownloads ? downloadsDisabledCommand : lyricsCommand
 	})
 ];
 

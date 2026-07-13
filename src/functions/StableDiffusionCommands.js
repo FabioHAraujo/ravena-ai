@@ -57,17 +57,104 @@ const DEFAULT_PARAMS = {
  * @returns {Promise<ReturnMessage|Array<ReturnMessage>>} - ReturnMessage ou array de ReturnMessages
  */
 
+/**
+ * Tenta obter um prompt refinado a partir de uma imagem + modificações do usuário.
+ * Faz duas chamadas LLM:
+ *   1. Descreve a imagem detalhadamente
+ *   2. Reescreve a descrição aplicando as modificações solicitadas pelo usuário
+ * Retorna null silenciosamente em caso de falha.
+ * @param {Object} message - Dados da mensagem
+ * @param {string} userPrompt - Modificações desejadas pelo usuário
+ * @returns {Promise<string|null>}
+ */
+async function getImageDescriptionForPrompt(message, userPrompt) {
+	try {
+		let imageData = null;
+
+		// Caso 1: mensagem atual é uma imagem com caption contendo o comando
+		if (message.type === "image") {
+			if (message.content?.data) {
+				imageData = message.content.data;
+			} else if (typeof message.downloadMedia === "function") {
+				const media = await message.downloadMedia().catch(() => null);
+				imageData = media?.data ?? null;
+			}
+		}
+
+		// Caso 2: mensagem de texto com imagem quoted
+		if (!imageData && message.hasQuotedMsg) {
+			const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
+			if (quotedMsg && quotedMsg.type === "image") {
+				const media = await quotedMsg.downloadMedia().catch(() => null);
+				imageData = media?.data ?? null;
+			}
+		}
+
+		if (!imageData) return null;
+
+		// 1ª chamada: descreve a imagem detalhadamente
+		logger.info("[getImageDescriptionForPrompt] 1ª chamada LLM: descrevendo imagem");
+		const description = await llmService.getCompletion({
+			prompt:
+				"Analyze this image and provide a detailed description for use as an image generation prompt. Include: art style (realistic, cartoon, anime, painting, etc.), color palette, main subjects, mood/atmosphere, lighting, background details, and any notable visual elements. Be descriptive and specific. Answer in English.",
+			systemContext:
+				"You are an expert at describing images for AI image generation prompts. Be detailed, specific and visual.",
+			image: imageData,
+			maxTokens: 300,
+			priority: 4
+		});
+
+		if (
+			!description ||
+			description.includes("Não foi poss") ||
+			description.includes("Ocorreu um erro")
+		) {
+			return null;
+		}
+
+		const baseDescription = description.trim();
+		logger.info(
+			`[getImageDescriptionForPrompt] Descrição obtida: ${baseDescription.substring(0, 80)}...`
+		);
+
+		// 2ª chamada: reescreve a descrição aplicando as modificações do usuário
+		logger.info("[getImageDescriptionForPrompt] 2ª chamada LLM: aplicando modificações");
+		const refinedPrompt = await llmService.getCompletion({
+			prompt: `Rewrite the description of this image:\n${baseDescription}\n\nModifications to apply:\n${userPrompt}`,
+			systemContext:
+				"You are an expert at writing image generation prompts. Rewrite the image description incorporating the requested modifications naturally, keeping a cohesive and detailed prompt. Answer in English.",
+			maxTokens: 350,
+			priority: 4
+		});
+
+		if (
+			!refinedPrompt ||
+			refinedPrompt.includes("Não foi poss") ||
+			refinedPrompt.includes("Ocorreu um erro")
+		) {
+			// Fallback: retorna só a descrição base se o refinamento falhar
+			return baseDescription;
+		}
+
+		return refinedPrompt.trim();
+	} catch (e) {
+		logger.warn("[getImageDescriptionForPrompt] Falhou silenciosamente:", e.message);
+		return null;
+	}
+}
+
 async function generateImage(bot, message, args, group, skipNotify = false) {
 	const chatId = message.group ?? message.author;
 	const returnMessages = [];
 
-	const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
+	// Prompt vem da caption (se for imagem) ou dos args (se for texto)
 	let prompt = args.join(" ");
-	if (quotedMsg) {
-		const quotedText = quotedMsg.caption ?? quotedMsg.content ?? quotedMsg.body;
-		if (quotedText) {
-			prompt += " " + quotedText;
-		}
+
+	// Tenta obter prompt refinado a partir de imagem (na msg atual ou na quoted) + modificações do usuário
+	const imageDescription = await getImageDescriptionForPrompt(message, prompt);
+	if (imageDescription) {
+		logger.info("[StableDiffusionCommands] Usando prompt refinado por imagem");
+		prompt = imageDescription;
 	}
 
 	if (prompt.length < 4) {
@@ -83,74 +170,82 @@ async function generateImage(bot, message, args, group, skipNotify = false) {
 	logger.info(`Gerando imagem com prompt: '${prompt}'`);
 
 	try {
-		if (!skipNotify) {
-			// Envia mensagem de processamento
-			await bot.sendReturnMessages(
-				new ReturnMessage({
-					chatId,
-					content: `📷 Gerando imagem para '${prompt}', isso pode levar alguns segundos...`,
-					reaction: process.env.LOADING_EMOJI ?? "⌛️"
-				}),
-				group
-			);
-		}
+		// Reação inicial de carregamento (assíncrona)
+		message.origin.react(process.env.LOADING_EMOJI ?? "⌛️").catch(() => {});
 
-		const safetyQuestion = `Check if this image generation prompt is generating concering porn or nude content: "${prompt}". 
+		const EventHandler = require("../EventHandler");
+		EventHandler.getInstance().emit("activity", { type: "imagine" });
+
+		// 1. Promise de Segurança (LLM)
+		const safetyPromise = (async () => {
+			try {
+				const safetyQuestion = `Check if this image generation prompt is generating concering porn or nude content: "${prompt}". 
     Adult themes and sexually suggestive is acceptable ok, filter only very explicit requests, implicit is fine. NSFW is not a problem, as long as it does not include: child, necro, gore, racism.
     Your answer ((must)) include "SAFE" or "UNSAFE" followed by a brief reason. If it's related to child related content, include warning emojis in your reponse.`;
 
-		const safetyResponse = await llmService.getCompletion({
-			prompt: safetyQuestion,
-			systemContext: "You are a content safety filter.",
-			priority: 3
-		});
+				const safetyResponse = await llmService.getCompletion({
+					prompt: safetyQuestion,
+					systemContext: "You are a content safety filter.",
+					priority: 3
+				});
 
-		let safetyMsg = "";
-		// Check if the response indicates unsafe content
-		if (
-			safetyResponse.substring(0, 10).toLowerCase().includes("unsafe") ||
-			prompt.toLowerCase().includes("gore")
-		) {
-			// Log the inappropriate request
-			const reportMessage = `⚠️ INAPPROPRIATE IMAGE REQUEST ⚠️\nUser: ${message.author}\nName: ${message.authorName || "Unknown"}\nPrompt: ${prompt}\nLLM Response: ${safetyResponse}\n\n!sa-block ${message.author}`;
-			bot.sendMessage(process.env.GRUPO_LOGS, reportMessage);
+				// Check if the response indicates unsafe content
+				if (
+					safetyResponse.substring(0, 10).toLowerCase().includes("unsafe") ||
+					prompt.toLowerCase().includes("gore")
+				) {
+					// Log the inappropriate request
+					const reportMessage = `⚠️ INAPPROPRIATE IMAGE REQUEST ⚠️\nUser: ${message.author}\nName: ${
+						message.authorName || "Unknown"
+					}\nPrompt: ${prompt}\nLLM Response: ${safetyResponse}\n\n!sa-block ${message.author}`;
+					bot.sendMessage(process.env.GRUPO_LOGS, reportMessage);
 
-			safetyMsg =
-				"\n\n> ⚠️ *AVISO*: O conteúdo solicitado é duvidoso. Esta solicitação será revisada pelo administrador e pode resultar em suspensão.";
-		}
+					return "\n\n> ⚠️ *AVISO*: O conteúdo solicitado é duvidoso. Esta solicitação será revisada pelo administrador e pode resultar em suspensão.";
+				}
+			} catch (e) {
+				logger.error("Erro na verificação de segurança (LLM):", e);
+			}
+			return "";
+		})();
 
-		// Inicia cronômetro para medir tempo de geração
-		const startTime = Date.now();
+		// 2. Promise de Geração de Imagem
+		const generationPromise = (async () => {
+			const startTime = Date.now();
+			const payload = {
+				prompt,
+				negative_prompt:
+					"bad anatomy, bad hands, text, missing fingers, extra digit, fewer digits, cropped, low-res, worst quality, jpeg artifacts, signature, watermark, username, blurry",
+				...DEFAULT_PARAMS
+			};
 
-		// Parâmetros para a API
-		const payload = {
-			prompt,
-			negative_prompt:
-				"bad anatomy, bad hands, text, missing fingers, extra digit, fewer digits, cropped, low-res, worst quality, jpeg artifacts, signature, watermark, username, blurry",
-			...DEFAULT_PARAMS
-		};
+			const response = await axios.post(`${getApiUrl()}/sdapi/v1/txt2img`, payload, {
+				headers: {
+					Authorization: sdWebUIToken,
+					"Content-Type": "application/json"
+				},
+				timeout: 120000 // 2 minutos de timeout
+			});
 
-		// Faz a requisição à API
-		const response = await axios.post(`${getApiUrl()}/sdapi/v1/txt2img`, payload, {
-			headers: {
-				Authorization: sdWebUIToken,
-				"Content-Type": "application/json"
-			},
-			timeout: 120000 // 2 minutos de timeout
-		});
+			const generationTime = ((Date.now() - startTime) / 1000).toFixed(1);
 
-		// Calcula o tempo de geração
-		const generationTime = ((Date.now() - startTime) / 1000).toFixed(1);
+			if (!response.data || !response.data.images || response.data.images.length === 0) {
+				throw new Error("A API não retornou imagens");
+			}
 
-		// Verifica se a resposta contém as imagens
-		if (!response.data || !response.data.images || response.data.images.length === 0) {
-			throw new Error("A API não retornou imagens");
-		}
+			const imageBase64 = response.data.images[0];
+			const info = JSON.parse(response.data.info || "{}");
+			const modelName = info.sd_model_name || "Modelo desconhecido";
 
-		// Obtém a primeira imagem (base64) e informações
-		const imageBase64 = response.data.images[0];
-		const info = JSON.parse(response.data.info || "{}");
-		const modelName = info.sd_model_name || "Modelo desconhecido";
+			return {
+				imageBase64,
+				generationTime,
+				modelName
+			};
+		})();
+
+		// Aguarda ambos em paralelo
+		const [safetyMsg, genResult] = await Promise.all([safetyPromise, generationPromise]);
+		const { imageBase64, generationTime, modelName } = genResult;
 
 		// Verificar NSFW antes de enviar
 		// Primeiro, salva a imagem temporariamente para análise

@@ -8,9 +8,11 @@ const LLMService = require("./services/LLMService");
 const SpeechCommands = require("./functions/SpeechCommands");
 const { aiCommand } = require("./functions/AICommands");
 const SummaryCommands = require("./functions/SummaryCommands");
+const { PermissionsBitField } = require("discord.js");
 const NSFWPredict = require("./utils/NSFWPredict");
 const MuNewsCommands = require("./functions/MuNewsCommands");
 const HoroscopoCommands = require("./functions/HoroscopoCommands");
+const Copa2026 = require("./functions/Copa2026");
 const RankingMessages = require("./functions/RankingMessages");
 const fs = require("fs").promises;
 const path = require("path");
@@ -54,6 +56,8 @@ class EventHandler extends EventEmitter {
 		this.recentlyJoined = [];
 		this.PV_AI_DEBOUNCE_MS = 8000;
 		this.pvDebounce = {};
+		this.activeSpammers = new Set();
+		this.spammerActiveWindowUntil = 0;
 
 		this.logger.info(`[EventHandler] CmdWhitelist:`, this.comandosWhitelist);
 		this.loadGroups();
@@ -80,9 +84,20 @@ class EventHandler extends EventEmitter {
 	 * Obtém grupo por ID, cria se não existir
 	 * @param {string} groupId - O ID do grupo
 	 * @param {string} name - O nome do grupo (opcional)
+	 * @param {string} prefix - O prefixo padrão (opcional)
+	 * @param {string} addedBy - Quem adicionou o bot (opcional)
+	 * @param {Object} bot - Instância do bot (opcional)
+	 * @param {Object} message - Mensagem que disparou a criação (opcional)
 	 * @returns {Promise<Group>} - O objeto do grupo
 	 */
-	async getOrCreateGroup(groupId, name = null, prefix = "?", addedBy = null) {
+	async getOrCreateGroup(
+		groupId,
+		name = null,
+		prefix = "?",
+		addedBy = null,
+		bot = null,
+		message = null
+	) {
 		try {
 			let newGroup = false;
 			if (!this.groups[groupId]) {
@@ -98,8 +113,28 @@ class EventHandler extends EventEmitter {
 					this.groups[groupId] = new Group(existingGroup);
 				} else {
 					// Cria novo grupo
-					let displayName =
-						name ?? groupId.split("@")[0].toLowerCase().replace(/\s+/g, "").substring(0, 16);
+					let displayName = name
+						? name.trim()
+						: groupId
+								.split("@")[0]
+								.toLowerCase()
+								.replace(/[^a-zA-Z0-9_\-.]/g, "")
+								.substring(0, 30);
+
+					// Verifica se é Discord para formatar o nome como solicitado: nome-guild-nome-do-canal
+					if (bot && bot.useDiscord && message && message.guildId) {
+						try {
+							const guild = await bot.discordClient.guilds.fetch(message.guildId);
+							const channel = await bot.discordClient.channels.fetch(message.group);
+							if (guild && channel) {
+								const cleanGuild = guild.name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 14);
+								const cleanChannel = channel.name.replace(/[^a-zA-Z0-9]/g, "").substring(0, 14);
+								displayName = `${cleanGuild}-${cleanChannel}`.toLowerCase();
+							}
+						} catch (discordErr) {
+							this.logger.error("Erro ao buscar nomes no Discord para displayName:", discordErr);
+						}
+					}
 
 					// Verifica se já tem grupo com esse nome antes
 					let grupoExistente = await this.database.getGroupByName(displayName);
@@ -208,6 +243,12 @@ class EventHandler extends EventEmitter {
 			)
 				return;
 
+			// --- Prevenção de Spam Ativo ---
+			if (await this.checkSpammerMessage(bot, message)) {
+				return;
+			}
+			// -------------------------------
+
 			// --- Filtro de Bloqueio Local ---
 			let isLocalBlocked = false;
 
@@ -235,7 +276,7 @@ class EventHandler extends EventEmitter {
 
 			// Newsletter/Canais: Apenas pra detectar jrmunews, horóscopos, etc.
 			if (message.isNewsletter) {
-				//this.logger.debug(`[processMessage] Recebido newsletter`, { message })
+				// this.logger.debug(`[processMessage] Recebido newsletter`, { message });
 				try {
 					const isNewsDetected = await MuNewsCommands.detectNews(message.content, message.from);
 					if (isNewsDetected) {
@@ -257,6 +298,8 @@ class EventHandler extends EventEmitter {
 						//   this.logger.error('Erro ao enviar confirmação de Horoscopo:', error);
 						// });
 					}
+
+					await Copa2026.detectCopaGif(message, bot);
 				} catch (error) {
 					this.logger.error("Erro ao verificar Newsletter:", error);
 				}
@@ -283,7 +326,16 @@ class EventHandler extends EventEmitter {
 			//this.userGreetingManager.processGreeting(bot, message);
 
 			// Obtém conteúdo de texto da mensagem (corpo ou legenda)
-			const textContent = message.type === "text" ? message.content : message.caption;
+			let textContent = message.type === "text" ? message.content : message.caption;
+
+			// Limpa espaços e markup de monospace do WhatsApp (backticks)
+			if (textContent && typeof textContent === "string") {
+				textContent = textContent.trim();
+				// Remove backticks se estiverem no início e fim (ex: `!ping`)
+				if (textContent.startsWith("`") && textContent.endsWith("`")) {
+					textContent = textContent.slice(1, -1).trim();
+				}
+			}
 
 			// Se mensagem de grupo, obtém ou cria o grupo
 			let group = null;
@@ -293,10 +345,12 @@ class EventHandler extends EventEmitter {
 				SummaryCommands.storeMessage(message, message.group, bot);
 
 				const groupData = await this.getOrCreateGroup(
-					message.guildId ?? message.group,
+					message.group ?? message.guildId,
 					null,
 					bot.prefix,
-					message.author
+					message.author,
+					bot,
+					message
 				);
 				group = groupData.group;
 
@@ -336,9 +390,11 @@ class EventHandler extends EventEmitter {
 				}
 
 				// Ajuda com recuperação de grupo
+				const botNameRecovery = (bot.nomeExibir || "ravena").toLowerCase();
 				if (
 					textContent &&
-					textContent.trim().toLowerCase() === "ravena, ajude a recuperar meu grupo!"
+					typeof textContent === "string" &&
+					textContent.trim().toLowerCase() === `ravena, ajude a recuperar meu grupo!`
 				) {
 					try {
 						const chat = await message.origin.getChat();
@@ -441,7 +497,7 @@ class EventHandler extends EventEmitter {
 
 			// Se não houver conteúdo de texto, não pode ser um comando ou menção
 			if (!textContent) {
-				return this.processNonCommandMessage(bot, message, group);
+				return this.processNonCommandMessage(bot, message, group, textContent);
 			}
 
 			// Verifica menções ao bot
@@ -462,7 +518,10 @@ class EventHandler extends EventEmitter {
 			if (isCommand) {
 				// Se o prefixo for vazio, usa o texto completo como comando
 				// Se não, remove o prefixo do início
-				const commandText = prefix === "" ? textContent : textContent.substring(prefix.length);
+				let commandText = prefix === "" ? textContent : textContent.substring(prefix.length);
+
+				// Remove espaços extras após o prefixo (ex: "! ping" -> "ping")
+				commandText = commandText.trimStart();
 
 				// IMPORTANTE: Verificação especial para comandos de gerenciamento mesmo com prefixo vazio
 				if (commandText.startsWith("g-")) {
@@ -489,7 +548,7 @@ class EventHandler extends EventEmitter {
 			} else {
 				// Processa mensagem não-comando
 				// Aqui também vai cair quando o grupo tiver a opção customIgnoresPrefix, que os comandos personalizados não precisam de prefixo
-				this.processNonCommandMessage(bot, message, group).catch((error) => {
+				this.processNonCommandMessage(bot, message, group, textContent).catch((error) => {
 					this.logger.error("Erro em processNonCommandMessage:", error);
 				});
 			}
@@ -503,8 +562,9 @@ class EventHandler extends EventEmitter {
 	 * @param {WhatsAppBot} bot - A instância do bot
 	 * @param {Object} message - A mensagem formatada
 	 * @param {Group} group - O objeto do grupo (se em grupo)
+	 * @param {string} textContent - O texto da mensagem (opcional, já limpo)
 	 */
-	async processNonCommandMessage(bot, message, group) {
+	async processNonCommandMessage(bot, message, group, textContent = null) {
 		// Verifica se é uma mensagem de voz para processamento automático de STT
 		const processed = await SpeechCommands.processAutoSTT(bot, message, group, {
 			returnResult: true
@@ -615,7 +675,9 @@ class EventHandler extends EventEmitter {
 			try {
 				// Se o grupo escolheu a opção 'customIgnoresPrefix', pode ser que um comando personalizado esteja sendo executado
 				// Gera um comando e manda pro handleCommand, mas com a flag de ser apenas custom
-				const textContent = message.type === "text" ? message.content : message.caption;
+				if (!textContent) {
+					textContent = message.type === "text" ? message.content : message.caption;
+				}
 
 				if (group.customIgnoresPrefix) {
 					this.commandHandler.processCustomIgnoresPrefix(textContent, bot, message, group);
@@ -865,10 +927,82 @@ class EventHandler extends EventEmitter {
 
 		//this.logger.info(`[processGroupJoin] `, { data });
 
+		// Carrega o grupo para verificar se o usuário que entrou está bloqueado
+		try {
+			const group = await this.database.getGroup(groupId);
+			if (
+				group &&
+				group.filters &&
+				group.filters.people &&
+				Array.isArray(group.filters.people) &&
+				group.filters.people.length > 0
+			) {
+				const userId = data.user.id;
+				let userPn = userId.split("@")[0];
+				let userLid = null;
+
+				try {
+					const contact = await bot.client.getContactById(userId);
+					if (contact) {
+						userPn = contact.id._serialized.split("@")[0];
+						if (contact.lid) {
+							userLid = contact.lid.split("@")[0];
+						}
+					}
+				} catch (contactErr) {
+					this.logger.error(
+						`[processGroupJoin] Erro ao obter contato ${userId} para validação de ban:`,
+						contactErr.message
+					);
+				}
+
+				const isBlocked = group.filters.people.some((blocked) => {
+					const blockedClean = blocked.split("@")[0];
+					return blockedClean === userPn || (userLid && blockedClean === userLid);
+				});
+
+				if (isBlocked) {
+					this.logger.warn(
+						`[processGroupJoin] Usuário bloqueado detectado ao entrar no grupo: ${userId} (LID: ${userLid}) no grupo ${groupId}. Removendo imediatamente.`
+					);
+					await bot.removeFromGroup(groupId, [userId]);
+					return;
+				}
+			}
+		} catch (dbErr) {
+			this.logger.error(`[processGroupJoin] Erro ao verificar filtros do grupo ${groupId}:`, dbErr);
+		}
+
 		if (!isBotJoining) {
 			// Se não for o bot sendo adicionado, coloca pessoa numa lista pra ignorar o join e evitar spam no grupo
 			//if(this.recentlyJoined.includes(data.user.id)) return;
 			this.recentlyJoined.push(data.user.id);
+
+			const fixedGroups = [
+				process.env.GRUPO_INTERACAO,
+				process.env.GRUPO_PESCA,
+				process.env.GRUPO_DOWNLOADS
+			].filter(Boolean);
+
+			if (data.user && data.user.id && fixedGroups.includes(groupId)) {
+				const userId = data.user.id;
+				const userPhone = userId.split("@")[0];
+				if (userPhone.startsWith("63") || userPhone.startsWith("62")) {
+					this.logger.warn(
+						`[processGroupJoin] Spammer detectado via join event: ${userId} no grupo ${groupId}`
+					);
+					this.activeSpammers.add(userId);
+					this.activeSpammers.add(userPhone);
+					this.spammerActiveWindowUntil = Date.now() + 5 * 60 * 1000; // Ativa janela de monitoramento por 5 minutos
+					setTimeout(
+						() => {
+							this.activeSpammers.delete(userId);
+							this.activeSpammers.delete(userPhone);
+						},
+						5 * 60 * 1000
+					);
+				}
+			}
 		}
 
 		setTimeout(
@@ -913,16 +1047,13 @@ class EventHandler extends EventEmitter {
 			);
 
 			// Obtém ou cria grupo
-			const nomeGrupo =
-				data.group?.name
-					?.replace(/[^a-zA-Z0-9 ]/g, "")
-					.replace(/(?:^\w|[A-Z]|\b\w)/g, (w, i) => (i === 0 ? w.toLowerCase() : w.toUpperCase()))
-					.replace(/\s+/g, "") ?? null;
+			const nomeGrupo = data.group?.name?.replace(/[^a-zA-Z0-9_\-.]/g, "").substring(0, 30) ?? null;
 			const groupData = await this.getOrCreateGroup(
 				data.group.id,
 				nomeGrupo,
 				bot.prefix,
-				data.responsavel?.id || data.responsavel
+				data.responsavel?.id || (typeof data.responsavel === "string" ? data.responsavel : null),
+				bot
 			);
 			const group = groupData.group;
 
@@ -956,8 +1087,19 @@ class EventHandler extends EventEmitter {
 				}
 				*/
 
-				const joinSilencioso = bot.joinSilencioso ?? false;
-				// Envia notificação para o grupo de logs
+				const joinSilenciosoGlobal = bot.joinSilencioso ?? false;
+				const joinSilenciosoGrupo =
+					bot.silentJoinGroups instanceof Set && bot.silentJoinGroups.has(groupId);
+				const joinSilencioso = joinSilenciosoGlobal || joinSilenciosoGrupo;
+
+				// Se foi um join silencioso por grupo, remove do set e loga no terminal
+				if (joinSilenciosoGrupo) {
+					bot.silentJoinGroups.delete(groupId);
+					this.logger.info(
+						`[processGroupJoin] 🔇 JOIN SILENCIOSO para grupo ${groupId} (${group.name}) - nenhuma mensagem de boas-vindas será enviada.`
+					);
+				}
+
 				if (bot.grupoLogs) {
 					try {
 						const msgJoin = `🚪🟢 *${bot.id}* entrou no grupo:
@@ -983,6 +1125,7 @@ class EventHandler extends EventEmitter {
 					`Bot entrou no grupo ${data.group.name} (${nomeGrupo}/${data.group.id}, ${groupData.newGroup ? "novo" : "antigo"})`
 				);
 				group.paused = false; // Sempre que o bot entra no grupo, tira o pause (para grupos em que saiu/foi removido)
+				await this.database.recordGroupJoin(group.id, group.name, Date.now(), data.responsavel);
 				await this.database.saveGroup(group);
 
 				// Busca pendingJoins para ver se esse grupo corresponde a um convite pendente
@@ -990,7 +1133,9 @@ class EventHandler extends EventEmitter {
 				let foundInviter = null;
 
 				// Obtém todos os membros do grupo para verificação
-				const members = chat.participants.map((p) => p.id._serialized);
+				const members = (chat.participants || [])
+					.filter((p) => p && p.id)
+					.map((p) => p.id._serialized);
 				const stringifiedData = JSON.stringify(data);
 
 				for (const pendingJoin of pendingJoins) {
@@ -1012,7 +1157,8 @@ class EventHandler extends EventEmitter {
 				if (groupData.newGroup) {
 					this.logger.debug(`[groupJoin] Novo grupo, enviando toda mensagem de boas vindas`);
 					if (!joinSilencioso) {
-						botInfoMessage = `🦇 Olá, grupo! Eu sou a *ravenabot*, um bot de WhatsApp. Use "${group.prefix}cmd" para ver os comandos disponíveis.`;
+						const botDisplayName = bot.nomeExibir || "ravenabot";
+						botInfoMessage = `🦇 Olá, grupo! Eu sou a *${botDisplayName}*, um bot de WhatsApp. Use "${group.prefix}cmd" para ver os comandos disponíveis.`;
 						try {
 							const groupJoinPath = path.join(
 								this.database.databasePath,
@@ -1073,7 +1219,8 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 							if (bot.supportMsg && bot.supportMsg.length > 0) {
 								botInfoMessage += `\n---☭---☭---☭---☭---☭---☭---☭---☭---\n${bot.supportMsg}`;
 							} else {
-								botInfoMessage += `\n\n⭕ Este é um número da ☭ *ravena comunitária* ☭, um chip e celular fornecido por um membro da comunidade da ravena, não o criador oficial. O código, base de dados e servidor é exatamente o mesmo das outras ravenas! ⭕\n_Saiba mais enviando !comunitaria, acessando o site oficial ou no !grupao_`;
+								const genericName = bot.nomeExibir || "ravena";
+								botInfoMessage += `\n\n⭕ Este é um número da ☭ *${genericName} comunitária* ☭, um chip e celular fornecido por um membro da comunidade da ${genericName}, não o criador oficial. O código, base de dados e servidor é exatamente o mesmo das outras ${genericName}s! ⭕\n_Saiba mais enviando !comunitaria, acessando o site oficial ou no !grupao_`;
 							}
 						}
 
@@ -1101,7 +1248,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 											botPersonality: {
 												type: "string",
 												description:
-													"Personalidade do bot para este grupo com no máximo 500 caracteres: deve soar como UM MEMBRO do grupo, usando a mesma linguagem, gírias e tom da galera. Se não conseguir definir, retorne string vazia."
+													"Personalidade do bot para este grupo com no máximo 1500 caracteres: deve soar como UM MEMBRO do grupo, usando a mesma linguagem, gírias e tom da galera. Se não conseguir definir, retorne string vazia."
 											}
 										},
 										required: ["welcomeMessage", "botPersonality"],
@@ -1110,11 +1257,12 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 								}
 							};
 
-							const llmPrompt = `Você é um bot de WhatsApp chamado ravenabot e foi adicionado em um grupo chamado '${groupInfo.name}'${llm_inviterInfo}. Descrição do grupo: '${groupInfo.description}'. Membros: ${groupInfo.memberCount}.
+							const botDisplayName = bot.nomeExibir || "ravenabot";
+							const llmPrompt = `Você é um bot de WhatsApp chamado ${botDisplayName} e foi adicionado em um grupo chamado '${groupInfo.name}'${llm_inviterInfo}. Descrição do grupo: '${groupInfo.description}'. Membros: ${groupInfo.memberCount}.
 
 Retorne um JSON com dois campos:
 1. "welcomeMessage": Uma mensagem de boas-vindas PRONTA para ser enviada diretamente no grupo, sem nenhum placeholder como "[foto aqui]" ou "[link]". Deve ser sucinta, engraçada, interativa e direta ao ponto. Use a linguagem e o tom típico desse tipo de grupo.
-2. "botPersonality": Uma personalidade curta (máx 500 caracteres) para o bot neste grupo. O bot deve soar como um MEMBRO do grupo — da mesma tribo, falando a mesma língua, usando as mesmas gírias e referências culturais. Ex para grupo de funk: "Tô no baile, parceiro! Manja de todas as novidades do funk, fala gíria à vontade e tá sempre no clima". Se não conseguir definir, retorne string vazia.`;
+2. "botPersonality": Uma personalidade curta (máx 1500 caracteres) para o bot neste grupo. O bot deve soar como um MEMBRO do grupo — da mesma tribo, falando a mesma língua, usando as mesmas gírias e referências culturais. Ex para grupo de funk: "Tô no baile, parceiro! Manja de todas as novidades do funk, fala gíria à vontade e tá sempre no clima". Se não conseguir definir, retorne string vazia.`;
 
 							// Obtém conclusão do LLM sem bloquear
 							this.llmService
@@ -1135,16 +1283,21 @@ Retorne um JSON com dois campos:
 											`[groupJoin] Resposta do LLM não é JSON válido, usando como mensagem direta: ${llmResponse}`
 										);
 										// Fallback: usa resposta crua como mensagem de boas-vindas
-										bot.sendMessage(group.id, llmResponse, { delay: 5000 }).catch((error) => {
-											this.logger.error("Erro ao enviar mensagem de boas-vindas do grupo:", error);
-										});
+										if (bot.sendJoinInfo !== false) {
+											bot.sendMessage(group.id, llmResponse, { delay: 5000 }).catch((error) => {
+												this.logger.error(
+													"Erro ao enviar mensagem de boas-vindas do grupo:",
+													error
+												);
+											});
+										}
 										return;
 									}
 
 									const { welcomeMessage, botPersonality } = parsed;
 
 									// Envia a mensagem de boas-vindas gerada
-									if (welcomeMessage) {
+									if (welcomeMessage && bot.sendJoinInfo !== false) {
 										this.logger.debug(`[groupJoin] LLM Welcome: ${welcomeMessage}`);
 										bot.sendMessage(group.id, welcomeMessage, { delay: 5000 }).catch((error) => {
 											this.logger.error("Erro ao enviar mensagem de boas-vindas do grupo:", error);
@@ -1153,7 +1306,7 @@ Retorne um JSON com dois campos:
 
 									// Salva personalidade no grupo se for válida
 									if (botPersonality && botPersonality.trim().length > 0) {
-										group.customAIPrompt = botPersonality.trim().slice(0, 500);
+										group.customAIPrompt = botPersonality.trim().slice(0, 1500);
 										await this.database.saveGroup(group);
 										this.logger.info(
 											`[groupJoin] Personalidade definida para '${group.name}': ${group.customAIPrompt}`
@@ -1182,49 +1335,102 @@ Retorne um JSON com dois campos:
 						}
 					}
 				} else {
-					this.logger.debug(
-						`[groupJoin] Grupo já existente! Enviando toda mensagem de boas vindas`
-					);
-					try {
-						const groupJoinExistentePath = path.join(
-							this.database.databasePath,
-							"textos",
-							"groupJoinExistente.txt"
+					if (joinSilencioso) {
+						this.logger.info(
+							`[groupJoin] 🔇 Join silencioso - Grupo já existente (${group.name} / ${groupId}), boas-vindas suprimidas.`
 						);
+					} else {
+						this.logger.debug(
+							`[groupJoin] Grupo já existente! Enviando toda mensagem de boas vindas`
+						);
+						try {
+							const groupJoinExistentePath = path.join(
+								this.database.databasePath,
+								"textos",
+								"groupJoinExistente.txt"
+							);
 
-						// Verifica se o arquivo existe
-						const fileExists = await fs
-							.access(groupJoinExistentePath)
-							.then(() => true)
-							.catch(() => false);
+							// Verifica se o arquivo existe
+							const fileExists = await fs
+								.access(groupJoinExistentePath)
+								.then(() => true)
+								.catch(() => false);
 
-						if (fileExists) {
-							const fileContent = await fs.readFile(groupJoinExistentePath, "utf8");
-							if (fileContent && fileContent.trim() !== "") {
-								botInfoMessage = fileContent.trim();
-								// Substitui variável {prefix} se presente
-								botInfoMessage = botInfoMessage.replace(/{prefix}/g, group.prefix ?? "!");
-							}
+							if (fileExists) {
+								const fileContent = await fs.readFile(groupJoinExistentePath, "utf8");
+								if (fileContent && fileContent.trim() !== "") {
+									botInfoMessage = fileContent.trim();
+									// Substitui variável {prefix} se presente
+									botInfoMessage = botInfoMessage.replace(/{prefix}/g, group.prefix ?? "!");
+								}
 
-							botInfoMessage += `\n\nO nome do seu grupo está definido como *${group.name}*.
+								botInfoMessage += `\n\nO nome do seu grupo está definido como *${group.name}*.
 
 Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me envie no PV:
 - ${group.prefix}g-manage ${group.name}`;
+							}
+						} catch (readError) {
+							this.logger.error(
+								"Erro ao ler groupJoinExistente.txt, usando mensagem padrão:",
+								readError
+							);
+							const botDisplayName = bot.nomeExibir || "ravenabot";
+							botInfoMessage = `🦇 Olá, grupo! Eu sou a *${botDisplayName}*. Já estive aqui neste grupo antes, mas se tiverem dúvidas, é só mandar um *!cmd*\n\nFique por dentro das novidades:\n- https://ravena.moothz.win`;
 						}
-					} catch (readError) {
-						this.logger.error(
-							"Erro ao ler groupJoinExistente.txt, usando mensagem padrão:",
-							readError
+					}
+
+					this.logger.debug(`[groupJoin] botInfoMessage: ${botInfoMessage}`);
+
+					let targetId = group.id;
+					// Se for Discord, tenta encontrar um canal adequado se o ID do grupo (Guild ID) não for um canal válido
+					if (bot.useDiscord && data.origin) {
+						try {
+							// Append discord.txt if it exists
+							try {
+								const discordTxtPath = path.join(
+									this.database.databasePath,
+									"textos",
+									"discord.txt"
+								);
+								const discordTxtContent = await fs.readFile(discordTxtPath, "utf8");
+								if (discordTxtContent && discordTxtContent.trim() !== "") {
+									botInfoMessage += `\n\n${discordTxtContent.trim()}`;
+								}
+							} catch (e) {
+								// Ignora se arquivo não existir
+							}
+
+							const guild = await bot.discordClient.guilds.fetch(data.group.id);
+							const systemChannel = guild.systemChannelId;
+							if (systemChannel) {
+								targetId = systemChannel;
+							} else {
+								// Busca o primeiro canal de texto onde o bot pode falar
+								const channels = await guild.channels.fetch();
+								const firstChannel = channels.find(
+									(c) =>
+										c.isTextBased() &&
+										c
+											.permissionsFor(bot.discordClient.user)
+											.has(PermissionsBitField.Flags.SendMessages)
+								);
+								if (firstChannel) targetId = firstChannel.id;
+							}
+						} catch (e) {
+							this.logger.error("Erro ao definir canal de boas-vindas no Discord:", e);
+						}
+					}
+
+					if (!joinSilencioso && botInfoMessage && bot.sendJoinInfo !== false) {
+						bot.sendMessage(targetId, botInfoMessage).catch((error) => {
+							this.logger.error("Erro ao enviar mensagem de boas-vindas do grupo:", error);
+						});
+					} else if (joinSilencioso || bot.sendJoinInfo === false) {
+						this.logger.info(
+							`[groupJoin] 🔇 Join silencioso ou sendJoinInfo desativado - mensagem de boas-vindas suprimida para ${groupId} (${group.name})`
 						);
-						botInfoMessage = `🦇 Olá, grupo! Eu sou a *ravenabot*. Já estive aqui neste grupo antes, mas se tiverem dúvidas, é só mandar um *!cmd*\n\nFique por dentro das novidades:\n- https://ravena.moothz.win`;
 					}
 				}
-
-				this.logger.debug(`[groupJoin] botInfoMessage: ${botInfoMessage}`);
-
-				bot.sendMessage(group.id, botInfoMessage).catch((error) => {
-					this.logger.error("Erro ao enviar mensagem de boas-vindas do grupo:", error);
-				});
 			} else {
 				// Caso 2: Outra pessoa entrou no grupo
 				// Gera e envia mensagem de boas-vindas para o novo membro
@@ -1299,19 +1505,63 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				try {
 					if (isBotLeaving) {
 						const groupId = data.group.id;
-						const groupData = await this.getOrCreateGroup(groupId, null, bot.prefix);
+						const groupData = await this.getOrCreateGroup(groupId, null, bot.prefix, null, bot);
 						const group = groupData.group;
 
 						if (bot.addSkipGroup) {
 							await bot.addSkipGroup(groupId);
 						}
+
+						await this.database.recordGroupLeave(groupId, Date.now(), data.responsavel);
+						await this.database.saveGroup(group);
+
+						let membershipHistoryText = "";
+						try {
+							const periods = await this.database.getGroupMembershipPeriods(groupId);
+							if (periods && periods.length > 0) {
+								membershipHistoryText = `\n🚪 *Histórico de Estadia no Grupo:*\n`;
+								periods.forEach((p, idx) => {
+									const joinDate = p.join_timestamp
+										? new Date(p.join_timestamp).toLocaleString("pt-BR")
+										: "Desconhecido";
+									const leaveDate = p.leave_timestamp
+										? new Date(p.leave_timestamp).toLocaleString("pt-BR")
+										: "Ainda no grupo";
+
+									let durationText = "";
+									if (p.duration) {
+										const sec = Math.floor(p.duration / 1000);
+										const days = Math.floor(sec / 86400);
+										const hours = Math.floor((sec % 86400) / 3600);
+										const minutes = Math.floor((sec % 3600) / 60);
+
+										const parts = [];
+										if (days > 0) parts.push(`${days}d`);
+										if (hours > 0) parts.push(`${hours}h`);
+										if (minutes > 0) parts.push(`${minutes}m`);
+										if (parts.length === 0) parts.push("menos de 1m");
+										durationText = ` (${parts.join(" ")})`;
+									} else if (p.join_timestamp && p.leave_timestamp) {
+										durationText = " (tempo desconhecido)";
+									}
+
+									membershipHistoryText += `${idx + 1}. 🟢 ${joinDate} até 🔴 ${leaveDate}${durationText}\n`;
+								});
+							}
+						} catch (historyErr) {
+							this.logger.error(
+								"Erro ao carregar histórico de estadias para log de saída:",
+								historyErr
+							);
+						}
+
 						const msgLeave = `🚪🔴 *${bot.id}* saiu do grupo:
 - 🆔 *ID:* \`${group.id}\`
 - 📃 *Nome:* \`${group.name}\`
 - 👷‍♂️ *Responsável:*
 \`\`\`${JSON.stringify(data.responsavel, null, "\t")}\`\`\`
 - 👨‍💻 *Raw Data*:
-\`\`\`${JSON.stringify(data.group)}\`\`\``;
+\`\`\`${JSON.stringify(data.group)}\`\`\`${membershipHistoryText}`;
 
 						// Remove o responsável do bot comunitário dos admins adicionais
 						/* por enquanto desabilitado
@@ -1333,7 +1583,6 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 						}
 						*/
 
-						await this.database.saveGroup(group);
 						bot.sendMessage(bot.grupoLogs, msgLeave).catch((error) => {
 							this.logger.error(
 								"Erro ao enviar notificação de entrada no grupo para o grupo de logs:",
@@ -1416,7 +1665,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 			const messagesToSend = [];
 
 			// Função auxiliar para processar texto com variáveis
-			const processText = async (text) => {
+			const processText = async (text, mentionsList) => {
 				if (!text) return { text: "", mentions: [] };
 				let message = typeof text === "string" ? text : "";
 
@@ -1453,7 +1702,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				}
 
 				// Processa variáveis
-				const options = {};
+				const options = { mentions: [...mentionsList] };
 				message = await this.variableProcessor.process(message, {
 					message: false,
 					group,
@@ -1470,7 +1719,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 				// Se saudação de texto
 				if (type === "text") {
-					const processed = await processText(greetingData); // greetingData is the string itself for text type
+					const processed = await processText(greetingData, baseMentions); // greetingData is the string itself for text type
 					currentMentions = [...new Set([...currentMentions, ...processed.mentions])];
 
 					messagesToSend.push({
@@ -1499,7 +1748,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 						// Processa caption se houver (audio e sticker ignoram caption no envio, mas a gente processa igual)
 						let caption = "";
 						if (type !== "audio" && type !== "sticker") {
-							const processedCaption = await processText(greetingData.caption);
+							const processedCaption = await processText(greetingData.caption, baseMentions);
 							caption = processedCaption.text;
 							currentMentions = [...new Set([...currentMentions, ...processedCaption.mentions])];
 						}
@@ -1557,7 +1806,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 			const messagesToSend = [];
 			const baseMentions = [user.id];
 
-			const processText = async (text) => {
+			const processText = async (text, mentionsList) => {
 				if (!text) return { text: "", mentions: [] };
 				let message = typeof text === "string" ? text : "";
 
@@ -1570,7 +1819,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				message = message.replace(/{tituloGrupo}/g, chatData?.name ?? "Grupo");
 
 				// Processa variáveis
-				const options = {};
+				const options = { mentions: [...mentionsList] };
 				message = await this.variableProcessor.process(message, {
 					message: false,
 					group,
@@ -1587,7 +1836,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 				// Se despedida de texto
 				if (type === "text") {
-					const processed = await processText(farewellData);
+					const processed = await processText(farewellData, baseMentions);
 					currentMentions = [...new Set([...currentMentions, ...processed.mentions])];
 
 					messagesToSend.push({
@@ -1613,7 +1862,7 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 
 						let caption = "";
 						if (type !== "audio" && type !== "sticker") {
-							const processedCaption = await processText(farewellData.caption);
+							const processedCaption = await processText(farewellData.caption, baseMentions);
 							caption = processedCaption.text;
 							currentMentions = [...new Set([...currentMentions, ...processedCaption.mentions])];
 						}
@@ -1725,6 +1974,25 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				}
 			);
 
+			// Ativa a janela de monitoramento intenso por 5 minutos
+			this.spammerActiveWindowUntil = Date.now() + 5 * 60 * 1000;
+
+			// Adiciona à lista de spammers ativos para deletar mensagens
+			for (const spammer of spammersJids) {
+				this.activeSpammers.add(spammer);
+				const cleanPhone = spammer.split("@")[0];
+				this.activeSpammers.add(cleanPhone);
+
+				// Remove do set após 5 minutos
+				setTimeout(
+					() => {
+						this.activeSpammers.delete(spammer);
+						this.activeSpammers.delete(cleanPhone);
+					},
+					5 * 60 * 1000
+				);
+			}
+
 			// Remove do grupo
 			await bot.removeFromGroup(chatId, spammersJids);
 
@@ -1735,6 +2003,115 @@ Para fazer a configuração do grupo sem poluir aqui, envie \`!g-painel\`, ou me
 				await bot.removeFromCommunity(communityJid, spammersJids);
 			}
 		}
+	}
+
+	/**
+	 * Verifica se a mensagem recebida é de um spammer durante a janela ativa de prevenção
+	 * @param {WhatsAppBot} bot - A instância do bot
+	 * @param {Object} message - A mensagem recebida
+	 * @returns {Promise<boolean>} - True se a mensagem for de spammer e foi apagada
+	 */
+	async checkSpammerMessage(bot, message) {
+		const fixedGroups = [
+			process.env.GRUPO_INTERACAO,
+			process.env.GRUPO_PESCA,
+			process.env.GRUPO_DOWNLOADS
+		].filter(Boolean);
+
+		if (!message.group || !fixedGroups.includes(message.group)) {
+			return false;
+		}
+
+		const now = Date.now();
+		const isWindowActive = now < this.spammerActiveWindowUntil;
+
+		// Se a janela ativa estiver desativada e não houver spammers específicos na lista, não faz nada
+		if (!isWindowActive && this.activeSpammers.size === 0) {
+			return false;
+		}
+
+		// Verifica se o autor ou authorAlt é spammer
+		const isSpammer =
+			this.activeSpammers.has(message.author) ||
+			(message.authorAlt && this.activeSpammers.has(message.authorAlt)) ||
+			(isWindowActive &&
+				(message.author?.startsWith("63") ||
+					message.author?.startsWith("62") ||
+					(message.authorAlt &&
+						(message.authorAlt.startsWith("63") || message.authorAlt.startsWith("62")))));
+
+		if (isSpammer) {
+			this.logger.warn(
+				`[SpamPrevention] Janela ativa: ${isWindowActive ? "SIM" : "NÃO"}. Deletando mensagem de spammer ${message.author} no grupo ${message.group}`
+			);
+			if (message.key) {
+				await bot.deleteMessageByKey(message.key).catch((err) => {
+					this.logger.error("Erro ao deletar mensagem de spammer:", err);
+				});
+			}
+			return true;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Manipula evento de alteração de configuração do grupo (como fechar/abrir)
+	 * @param {WhatsAppBot} bot - A instância do bot
+	 * @param {Object} data - Dados do evento
+	 */
+	onGroupSettingsUpdate(bot, data) {
+		this.processGroupSettingsUpdate(bot, data).catch((error) => {
+			this.logger.error("Erro em processGroupSettingsUpdate:", error);
+		});
+	}
+
+	async processGroupSettingsUpdate(bot, data) {
+		const { groupId, announce, sender } = data;
+		const senderPhone = sender ? sender.split("@")[0] : "desconhecido";
+
+		this.logger.info(
+			`[processGroupSettingsUpdate] Grupo ${groupId} atualizado. announce=${announce}, alterado por ${senderPhone}`
+		);
+
+		// Carrega ou obtém o grupo
+		const groupData = await this.getOrCreateGroup(groupId, null, bot.prefix, null, bot);
+		const group = groupData.group;
+
+		// Se a alteração foi feita pelo próprio bot (enquanto executa os comandos abir/fechar), não precisamos reenviar notificação
+		const isMe = senderPhone === bot.phoneNumber;
+		if (isMe) {
+			this.logger.debug(
+				`[processGroupSettingsUpdate] Alteração feita pelo próprio bot. Ignorando notificação de repetição.`
+			);
+			return;
+		}
+
+		// Verifica se a notificação está ativada para o estado correspondente
+		if (announce && !group.notificaGrupoFechado) {
+			this.logger.debug(
+				`[processGroupSettingsUpdate] Notificação de grupo fechado desativada para o grupo ${groupId}.`
+			);
+			return;
+		}
+		if (!announce && !group.notificaGrupoAberto) {
+			this.logger.debug(
+				`[processGroupSettingsUpdate] Notificação de grupo aberto desativada para o grupo ${groupId}.`
+			);
+			return;
+		}
+
+		// Notifica no grupo sobre a alteração (sem expor quem alterou, usando bold no status)
+		const statusMsg = announce
+			? "🔒 *Grupo fechado.* Apenas administradores podem enviar mensagens agora."
+			: "🔓 *Grupo aberto.* Todos os participantes podem enviar mensagens agora.";
+
+		const returnMsg = new ReturnMessage({
+			chatId: groupId,
+			content: statusMsg
+		});
+
+		await bot.sendReturnMessages(returnMsg, group);
 	}
 
 	/**

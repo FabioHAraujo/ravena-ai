@@ -73,7 +73,19 @@ const foodAnalysisSchema = {
 
 async function getMediaFromMessage(message) {
 	if (message.type === "image") {
-		return message.content || (message.downloadMedia ? await message.downloadMedia() : null);
+		// Lazy loading: verifica se content já tem base64, senão baixa sob demanda
+		if (message.content && message.content.data) {
+			return message.content;
+		}
+		if (typeof message.downloadMedia === "function") {
+			try {
+				return await message.downloadMedia();
+			} catch (e) {
+				logger.error("[getMediaFromMessage] Erro ao baixar mídia:", e);
+				return null;
+			}
+		}
+		return null;
 	}
 
 	try {
@@ -95,6 +107,15 @@ function classifyMeal(date) {
 	if (hour >= 15 && hour < 19) return "Lanche da Tarde";
 	if (hour >= 19 && hour < 23) return "Janta";
 	return "Ceia";
+}
+
+function safeParseInt(val) {
+	if (typeof val === "number") return val;
+	if (typeof val === "string") {
+		const match = val.match(/\d+/);
+		if (match) return parseInt(match[0], 10);
+	}
+	return 0;
 }
 
 // --- Commands ---
@@ -127,14 +148,24 @@ async function comidaCommand(bot, message, args, group) {
 		const response = await llmService.getCompletion({
 			prompt: promptText,
 			systemContext:
-				"Você é um nutricionista especialista. Analise a imagem e identifique se há comida. Se houver, liste os ingredientes em Português do Brasil, estime a quantidade e as calorias. Retorne APENAS o JSON conforme o schema.",
+				"Você é um nutricionista especialista. Analise a imagem e identifique se há comida.\n" +
+				"Você deve retornar obrigatoriamente um objeto JSON seguindo exatamente esta estrutura:\n" +
+				"{\n" +
+				'  "is_food": true ou false,\n' +
+				'  "ingredients": [\n' +
+				'    { "name": "nome do ingrediente", "quantity": "quantidade", "calories": 123 }\n' +
+				"  ],\n" +
+				'  "total_calories": 456\n' +
+				"}\n" +
+				"Não inclua nenhum texto de introdução ou conclusão, retorne apenas o objeto JSON puro.",
 			image: media.data, // Assumes media.data is base64
 			response_format: foodAnalysisSchema
 		});
 
 		let analysis;
 		try {
-			analysis = JSON.parse(response);
+			const cleanResponse = response.replace(/```json|```/g, "").trim();
+			analysis = JSON.parse(cleanResponse);
 		} catch (e) {
 			logger.error("Failed to parse LLM response:", e);
 			return new ReturnMessage({
@@ -147,7 +178,92 @@ async function comidaCommand(bot, message, args, group) {
 			});
 		}
 
-		if (!analysis.is_food) {
+		// Se o objeto estiver aninhado dentro de uma chave como "analise" ou "food_analysis"
+		if (analysis && !analysis.ingredients && !analysis.ingredientes) {
+			const keys = Object.keys(analysis);
+			if (
+				keys.length === 1 &&
+				typeof analysis[keys[0]] === "object" &&
+				analysis[keys[0]] !== null
+			) {
+				analysis = analysis[keys[0]];
+			}
+		}
+
+		// Verifica se foi detectado comida (inspeção robusta de chaves e fallbacks)
+		let isFood = false;
+		for (const key of Object.keys(analysis)) {
+			const lowerKey = key.toLowerCase();
+			if (
+				lowerKey.includes("food") ||
+				lowerKey.includes("comida") ||
+				lowerKey.includes("refeicao") ||
+				lowerKey.includes("prato") ||
+				lowerKey.includes("alimento") ||
+				lowerKey.includes("identific")
+			) {
+				const val = analysis[key];
+				if (
+					val === true ||
+					(typeof val === "string" &&
+						(val.toLowerCase() === "sim" ||
+							val.toLowerCase() === "true" ||
+							val.toLowerCase() === "yes")) ||
+					(typeof val === "string" && val.length > 3) // Se for o nome do prato/alimento
+				) {
+					isFood = true;
+					break;
+				}
+			}
+		}
+
+		let rawIngredients =
+			analysis.ingredients ?? analysis.ingredientes ?? analysis.itens ?? analysis.alimentos ?? [];
+
+		// Se não houver ingredientes listados, mas temos identificação do prato, adiciona o prato como ingrediente único
+		if (!Array.isArray(rawIngredients) || rawIngredients.length === 0) {
+			const plateName =
+				analysis.nome_prato ??
+				analysis.alimento_identificado ??
+				analysis.identificacao ??
+				analysis.prato ??
+				analysis.alimento;
+			if (plateName && typeof plateName === "string") {
+				rawIngredients = [
+					{
+						name: plateName,
+						quantity: "1 porção",
+						calories: safeParseInt(
+							analysis.total_calories ?? analysis.calorias_totais ?? analysis.calorias
+						)
+					}
+				];
+			}
+		}
+
+		if (Array.isArray(rawIngredients) && rawIngredients.length > 0) {
+			isFood = true;
+		}
+
+		const ingredients = (Array.isArray(rawIngredients) ? rawIngredients : []).map((ing) => {
+			if (typeof ing === "string") {
+				return { name: ing, quantity: "n/a", calories: 0 };
+			}
+			return {
+				name: ing.name ?? ing.nome ?? ing.item ?? ing.alimento ?? "Ingrediente",
+				quantity: ing.quantity ?? ing.quantidade ?? ing.porcao ?? "n/a",
+				calories: safeParseInt(ing.calories ?? ing.calorias ?? ing.kcal)
+			};
+		});
+
+		const totalCalories = safeParseInt(
+			analysis.total_calories ??
+				analysis.calorias_totais ??
+				analysis.calorias ??
+				ingredients.reduce((sum, ing) => sum + ing.calories, 0)
+		);
+
+		if (!isFood) {
 			return new ReturnMessage({
 				chatId,
 				content:
@@ -164,11 +280,11 @@ async function comidaCommand(bot, message, args, group) {
 		const result = await database.dbRun(
 			dbName,
 			"INSERT INTO food_entries (user_id, group_id, timestamp, total_calories) VALUES (?, ?, ?, ?)",
-			[message.author, message.group || null, timestamp, analysis.total_calories]
+			[message.author, message.group || null, timestamp, totalCalories]
 		);
-		const entryId = result.lastID;
+		const entryId = result.lastID ?? result.lastInsertRowid;
 
-		const ingredientInserts = analysis.ingredients.map((ing) =>
+		const ingredientInserts = ingredients.map((ing) =>
 			database.dbRun(
 				dbName,
 				"INSERT INTO food_ingredients (entry_id, name, quantity, calories) VALUES (?, ?, ?, ?)",
@@ -181,11 +297,11 @@ async function comidaCommand(bot, message, args, group) {
 		const dateStr = new Date(timestamp).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
 		let responseText = `🍽️ *Análise de Comida*\n📅 ${dateStr}\n\n`;
 
-		analysis.ingredients.forEach((ing) => {
+		ingredients.forEach((ing) => {
 			responseText += `▫️ *${ing.name}*: ${ing.quantity} (~${ing.calories} kcal)\n`;
 		});
 
-		responseText += `\n🔥 *Total Calórico Estimado:* ${analysis.total_calories} kcal\n`;
+		responseText += `\n🔥 *Total Calórico Estimado:* ${totalCalories} kcal\n`;
 		responseText += `\n✅ _Dados salvos com sucesso! Use !comida-info para ver suas estatísticas._`;
 
 		return new ReturnMessage({

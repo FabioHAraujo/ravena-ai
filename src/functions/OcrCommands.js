@@ -23,9 +23,18 @@ async function ocrCommand(bot, message, args, group) {
 
 	try {
 		// 1. Get Media (direct or quoted)
-		const media = await getMediaFromMessage(message);
+		const { media, hadQuoted } = await getMediaFromMessage(message);
 
 		if (!media || !media.mimetype.includes("image")) {
+			// Distinguish: had a quoted message but couldn't recover it vs. no quoted at all
+			if (hadQuoted) {
+				return new ReturnMessage({
+					chatId,
+					content:
+						"⚠️ Não foi possível recuperar a mídia da mensagem marcada. Ela pode ter saído do cache ou o download falhou.",
+					options: { quotedMessageId: message.origin.id._serialized, goReply: message.origin }
+				});
+			}
 			return new ReturnMessage({
 				chatId,
 				content:
@@ -39,15 +48,22 @@ async function ocrCommand(bot, message, args, group) {
 			"Extraia TODO o texto presente nesta imagem. Retorne apenas o texto extraído, preservando a quebra de linhas, sem qualquer comentário, explicação ou introdução adicional.";
 
 		// 3. Get context for images if available
-		const ctxPath = path.join(database.databasePath, "textos", "llm_context_images.txt");
 		let systemContext =
 			"Você é um assistente especializado em OCR (Extração de Texto). Sua única tarefa é ler e transcrever o texto da imagem fornecida com precisão total.";
 
-		try {
-			const baseCtx = await fs.readFile(ctxPath, "utf8");
-			if (baseCtx) systemContext = baseCtx + "\n\n" + systemContext;
-		} catch (e) {
-			// Ignore if context file doesn't exist
+		if (bot.aiPersonality && bot.aiPersonality.trim().length > 0) {
+			const baseCtx =
+				bot.aiPersonality +
+				"\n\nSuas mensagens são processadas e enviadas pelo WhatsApp.\n\nO seu objetivo agora é analisar o conteúdo de imagem recebida, atendendo o que o usuário pediu no prompt (caso exista).";
+			systemContext = baseCtx + "\n\n" + systemContext;
+		} else {
+			const ctxPath = path.join(database.databasePath, "textos", "llm_context_images.txt");
+			try {
+				const baseCtx = await fs.readFile(ctxPath, "utf8");
+				if (baseCtx) systemContext = baseCtx + "\n\n" + systemContext;
+			} catch (e) {
+				// Ignore if context file doesn't exist
+			}
 		}
 
 		// 4. Call LLM Service
@@ -88,24 +104,37 @@ async function ocrCommand(bot, message, args, group) {
 }
 
 /**
- * Helper to get media from message or quoted message
+ * Helper to get media from message or quoted message.
+ * Returns { media, hadQuoted } where hadQuoted indicates if there was a quoted message
+ * (even if media recovery failed), allowing callers to show different error messages.
  */
 async function getMediaFromMessage(message) {
 	// If message has media directly
-	if (message.hasMedia || (message.type !== "text" && message.content && message.content.data)) {
-		return message.content;
+	if (message.hasMedia) {
+		if (message.content && message.content.data) {
+			return { media: message.content, hadQuoted: false };
+		}
+		// Se não tiver dados (lazy loading), tenta baixar
+		if (typeof message.downloadMedia === "function") {
+			const media = await message.downloadMedia();
+			return { media, hadQuoted: false };
+		}
 	}
+
+	// Check if this message has a quoted message reference
+	const hadQuoted = !!message.hasQuotedMsg;
 
 	// Try to get from quoted message
 	try {
 		const quotedMsg = await message.origin.getQuotedMessage();
 		if (quotedMsg && quotedMsg.hasMedia) {
-			return await quotedMsg.downloadMedia();
+			const media = await quotedMsg.downloadMedia();
+			return { media, hadQuoted };
 		}
 	} catch (error) {
 		logger.error("Error getting quoted media:", error);
 	}
-	return null;
+	return { media: null, hadQuoted };
 }
 
 const commands = [

@@ -70,6 +70,13 @@
 			"enabled": true
 		}
 	],
+	"bonsai": [
+		{
+			"name": "primary",
+			"url": "http://192.168.1.30:1234",
+			"enabled": true
+		}
+	],
 	"sdwebui": [
 		{
 			"name": "primary",
@@ -77,10 +84,10 @@
 			"enabled": true
 		}
 	],
-	"alltalk": [
+	"f5tts": [
 		{
 			"name": "primary",
-			"url": "http://192.168.1.10:7851",
+			"url": "http://192.168.1.10:5050",
 			"enabled": true
 		}
 	]

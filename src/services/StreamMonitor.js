@@ -7,6 +7,43 @@ const Database = require("../utils/Database");
 const Logger = require("../utils/Logger");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Retry helper with exponential backoff for network errors
+async function retryWithBackoff(fn, maxAttempts = 3, baseDelay = 2000) {
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			return await fn();
+		} catch (error) {
+			const isNetworkError =
+				error.code === "EAI_AGAIN" ||
+				error.code === "ETIMEDOUT" ||
+				error.code === "ECONNREFUSED" ||
+				error.code === "ECONNRESET" ||
+				error.code === "ENOTFOUND";
+			if (!isNetworkError) {
+				// Non-network errors (auth, rate limit, etc.) — rethrow immediately
+				throw error;
+			}
+			if (attempt === maxAttempts) {
+				// Exhausted retries — rethrow
+				throw error;
+			}
+			const delay = baseDelay * Math.pow(2, attempt - 1) + Math.random() * 1000;
+			await sleep(delay);
+		}
+	}
+}
+
+// Check if error is a DNS/network error (not an API/auth error)
+function isNetworkError(error) {
+	return (
+		error.code === "EAI_AGAIN" ||
+		error.code === "ETIMEDOUT" ||
+		error.code === "ECONNREFUSED" ||
+		error.code === "ECONNRESET" ||
+		error.code === "ENOTFOUND"
+	);
+}
+
 class StreamMonitor extends EventEmitter {
 	// Propriedade estática para armazenar a instância única
 	static instance = null;
@@ -40,6 +77,7 @@ class StreamMonitor extends EventEmitter {
 
 		this.channels = [];
 		this.streamStatuses = {};
+		this.lastPersistedStatuses = {};
 		this.twitchToken = null;
 		this.kickToken = null; // Added for Kick token
 		this.twitchClientId = process.env.TWITCH_CLIENT_ID;
@@ -56,12 +94,21 @@ class StreamMonitor extends EventEmitter {
 		};
 
 		this.youtubeNotFounds = {};
+		this.twitchNotFounds = {};
+		this.kickNotFounds = {};
+		this.reactivationTimer = null;
 
 		// Flag para verificar se o monitoramento está ativo
 		this.isMonitoring = false;
 		this.isReady = false;
 
 		this.logger = new Logger("stream-monitor");
+
+		// Cache em disco para controle de duplicatas em caso de reset de DB
+		this.notifiedCache = new Set();
+		this.notifiedCacheFile = path.join(this.database.databasePath, "notified_streams_cache.json");
+		this._loadNotifiedCache();
+
 		this.logger.info("Service StreamMonitor carregado (modo singleton - SQLite)");
 
 		// Initialize database
@@ -219,6 +266,15 @@ class StreamMonitor extends EventEmitter {
 					lastEventType,
 					lastEventTime
 				};
+
+				this.lastPersistedStatuses[key] = {
+					isLive: !!row.is_live,
+					title: row.title,
+					game: row.game,
+					lastVideo: lastVideo ? { id: lastVideo.id } : null,
+					lastEventType,
+					lastEventTime
+				};
 			}
 
 			this.logger.info(
@@ -275,6 +331,34 @@ class StreamMonitor extends EventEmitter {
 	}
 
 	/**
+	 * Check if the stream status has changed significantly enough to write to the database.
+	 * Significant changes include platform live state, stream title, game, or last video id/event history.
+	 * Minor details like lastChecked or viewerCount are kept in memory and do not trigger DB writes.
+	 * @param {string} key - The channel key (platform:name)
+	 * @param {Object} newStatus - The new status object
+	 * @returns {boolean} - True if a database write is necessary
+	 * @private
+	 */
+	_shouldUpdateDB(key, newStatus) {
+		const oldStatus = this.lastPersistedStatuses[key];
+		if (!oldStatus) {
+			return true;
+		}
+
+		const newVideoId = newStatus.lastVideo ? newStatus.lastVideo.id : null;
+		const oldVideoId = oldStatus.lastVideo ? oldStatus.lastVideo.id : null;
+
+		return (
+			!!newStatus.isLive !== !!oldStatus.isLive ||
+			newStatus.title !== oldStatus.title ||
+			newStatus.game !== oldStatus.game ||
+			newVideoId !== oldVideoId ||
+			newStatus.lastEventType !== oldStatus.lastEventType ||
+			newStatus.lastEventTime !== oldStatus.lastEventTime
+		);
+	}
+
+	/**
 	 * Update stream status in DB
 	 * @private
 	 */
@@ -283,6 +367,11 @@ class StreamMonitor extends EventEmitter {
 			const [platform, channelName] = key.split(":");
 			const lastVideoData = status.lastVideo ? JSON.stringify(status.lastVideo) : null;
 			const lastVideoId = status.lastVideo ? status.lastVideo.id : null;
+
+			// Check if a database write is actually required
+			if (!this._shouldUpdateDB(key, status)) {
+				return;
+			}
 
 			await this.database.dbRun(
 				this.dbNameMonitor,
@@ -303,10 +392,20 @@ class StreamMonitor extends EventEmitter {
 					status.lastChecked,
 					lastVideoId,
 					lastVideoData,
-					status.lastEventType,
-					status.lastEventTime
+					status.lastEventType || null,
+					status.lastEventTime || null
 				]
 			);
+
+			// Cache the new persisted state
+			this.lastPersistedStatuses[key] = {
+				isLive: !!status.isLive,
+				title: status.title,
+				game: status.game,
+				lastVideo: status.lastVideo ? { id: status.lastVideo.id } : null,
+				lastEventType: status.lastEventType,
+				lastEventTime: status.lastEventTime
+			};
 		} catch (error) {
 			this.logger.error(`Error updating status for ${key} in DB:`, error);
 		}
@@ -339,6 +438,33 @@ class StreamMonitor extends EventEmitter {
 			return;
 		}
 
+		// Failsafe: Prevent duplicate notification spam using persistent notifiedCache (even if DB is restored/reset)
+		let notificationKey;
+		if (eventName === "streamOnline") {
+			if (data.platform === "youtube" && data.videoId) {
+				notificationKey = `online:${data.platform}:${data.channelName.toLowerCase()}:${data.videoId}`;
+			} else {
+				const startedAt = data.startedAt || (status && status.startedAt);
+				if (startedAt) {
+					notificationKey = `online:${data.platform}:${data.channelName.toLowerCase()}:${startedAt}`;
+				}
+			}
+		} else if (eventName === "newVideo") {
+			if (data.videoId) {
+				notificationKey = `video:${data.platform}:${data.channelName.toLowerCase()}:${data.videoId}`;
+			}
+		}
+
+		if (notificationKey) {
+			if (this.notifiedCache.has(notificationKey)) {
+				this.logger.info(
+					`[Failsafe] Suppressing duplicate ${eventName} notification for ${channelKey} (Already in notifiedCache: ${notificationKey})`
+				);
+				return;
+			}
+			this._addNotifiedCache(notificationKey);
+		}
+
 		// For 'newVideo', the caller (poll function) handles ID uniqueness check.
 		// We pass it through here to ensure history is updated.
 
@@ -351,6 +477,62 @@ class StreamMonitor extends EventEmitter {
 
 		// Persist the event history immediately
 		await this._updateStatusInDB(channelKey, status);
+	}
+
+	/**
+	 * Carrega o cache de transmissões/vídeos notificados do arquivo JSON
+	 * @private
+	 */
+	_loadNotifiedCache() {
+		try {
+			if (fs.existsSync(this.notifiedCacheFile)) {
+				const data = JSON.parse(fs.readFileSync(this.notifiedCacheFile, "utf8"));
+				if (Array.isArray(data)) {
+					const now = Date.now();
+					const cutoff = now - 48 * 60 * 60 * 1000; // 48 horas de retenção
+
+					data.forEach((entry) => {
+						if (entry && entry.key && entry.timestamp && entry.timestamp > cutoff) {
+							this.notifiedCache.add(entry.key);
+						}
+					});
+					this.logger.info(
+						`Carregado cache de notificações com ${this.notifiedCache.size} chaves ativas.`
+					);
+				}
+			}
+		} catch (error) {
+			this.logger.error("Erro ao carregar cache de notificações:", error);
+		}
+	}
+
+	/**
+	 * Adiciona uma chave ao cache de notificações e persiste em disco
+	 * @private
+	 */
+	_addNotifiedCache(key) {
+		this.notifiedCache.add(key);
+		try {
+			let currentCache = [];
+			if (fs.existsSync(this.notifiedCacheFile)) {
+				try {
+					currentCache = JSON.parse(fs.readFileSync(this.notifiedCacheFile, "utf8")) || [];
+				} catch (e) {}
+			}
+
+			const now = Date.now();
+			const cutoff = now - 48 * 60 * 60 * 1000;
+
+			// Filtra chaves antigas e adiciona a nova
+			currentCache = currentCache.filter(
+				(entry) => entry && entry.timestamp && entry.timestamp > cutoff
+			);
+			currentCache.push({ key, timestamp: now });
+
+			this.database.saveJSONToFile(this.notifiedCacheFile, currentCache);
+		} catch (error) {
+			this.logger.error("Erro ao salvar cache de notificações:", error);
+		}
 	}
 
 	/**
@@ -377,7 +559,11 @@ class StreamMonitor extends EventEmitter {
 			this.pollingInterval
 		);
 
-		// Do an initial poll
+		// Start reactivation timer for paused channels
+		this.reactivationTimer = setInterval(() => this.checkPausedChannelsReactivation(), 60000 * 5);
+
+		// Do initial checks/polls
+		this.checkPausedChannelsReactivation();
 		this._pollTwitchChannels();
 		this._pollKickChannels();
 		this._pollYoutubeChannels();
@@ -396,6 +582,11 @@ class StreamMonitor extends EventEmitter {
 				this.pollingTimers[platform] = null;
 			}
 		});
+
+		if (this.reactivationTimer) {
+			clearInterval(this.reactivationTimer);
+			this.reactivationTimer = null;
+		}
 
 		this.isMonitoring = false;
 		this.logger.info("Monitoramento de streams interrompido");
@@ -486,6 +677,9 @@ class StreamMonitor extends EventEmitter {
 		const channelKey = `${normalizedSource}:${channelName.toLowerCase()}`;
 		if (this.streamStatuses[channelKey]) {
 			delete this.streamStatuses[channelKey];
+		}
+		if (this.lastPersistedStatuses && this.lastPersistedStatuses[channelKey]) {
+			delete this.lastPersistedStatuses[channelKey];
 		}
 
 		// Remove from DB
@@ -811,35 +1005,76 @@ class StreamMonitor extends EventEmitter {
 
 		let bAt = 0;
 		const failedBatches = [];
+		const twitchTimeout = 10000; // 10s timeout per request
 		for (const batch of channelBatches) {
 			bAt += 1;
 			//this.logger.info(`[_pollTwitchChannels][${bAt}/${totalBatches}] Polling ${batch.length} channels...`);
 			try {
-				// First get user IDs from login names
-				const userResponse = await axios.get(`https://api.twitch.tv/helix/users`, {
-					headers: {
-						"Client-ID": this.twitchClientId,
-						Authorization: `Bearer ${this.twitchToken}`
-					},
-					params: {
-						login: batch.map((c) =>
-							this.sanitizePlatformChannelName(c.name.toLowerCase(), "twitch")
-						)
-					}
-				});
+				// First get user IDs from login names — with retry + timeout
+				const userResponse = await retryWithBackoff(
+					async () =>
+						await axios.get(`https://api.twitch.tv/helix/users`, {
+							headers: {
+								"Client-ID": this.twitchClientId,
+								Authorization: `Bearer ${this.twitchToken}`
+							},
+							params: {
+								login: batch.map((c) =>
+									this.sanitizePlatformChannelName(c.name.toLowerCase(), "twitch")
+								)
+							},
+							timeout: twitchTimeout
+						}),
+					3,
+					2000
+				);
 
 				const userIds = userResponse.data.data.map((user) => user.id);
 
-				// Then get stream status for these users
-				const streamResponse = await axios.get(`https://api.twitch.tv/helix/streams`, {
-					headers: {
-						"Client-ID": this.twitchClientId,
-						Authorization: `Bearer ${this.twitchToken}`
-					},
-					params: {
-						user_id: userIds
+				const returnedLogins = userResponse.data.data.map((user) => user.login.toLowerCase());
+
+				// Check for not found channels
+				for (const channel of batch) {
+					const sanitizedName = this.sanitizePlatformChannelName(
+						channel.name.toLowerCase(),
+						"twitch"
+					);
+					if (!returnedLogins.includes(sanitizedName)) {
+						if (!this.twitchNotFounds[channel.name]) {
+							this.twitchNotFounds[channel.name] = 1;
+							this.logger.warn(
+								`Canal da Twitch não encontrado: '${channel.name}'. Iniciando contagem de erros.`
+							);
+						} else {
+							this.twitchNotFounds[channel.name]++;
+							this.logger.warn(
+								`Canal da Twitch não encontrado (${this.twitchNotFounds[channel.name]} vezes): '${channel.name}'.`
+							);
+							if (this.twitchNotFounds[channel.name] > 50) {
+								await this.pauseChannel(channel.name, "twitch");
+							}
+						}
+					} else {
+						this.twitchNotFounds[channel.name] = 0;
 					}
-				});
+				}
+
+				// Then get stream status for these users — with retry + timeout
+				const streamResponse = await retryWithBackoff(
+					async () =>
+						await axios.get(`https://api.twitch.tv/helix/streams`, {
+							headers: {
+								"Client-ID": this.twitchClientId,
+								Authorization: `Bearer ${this.twitchToken}`
+							},
+							params: {
+								user_id: userIds
+							},
+							timeout: twitchTimeout
+						}),
+					3,
+					2000
+				);
 
 				// Process the results
 				const liveStreams = streamResponse.data.data;
@@ -909,10 +1144,10 @@ class StreamMonitor extends EventEmitter {
 				} else {
 					failedBatches.push(batch);
 					this.logger.error(
-						"Error polling Twitch channels, adding to failed batch:",
+						`Error polling Twitch batch ${bAt} (${batch.length} channels), adding to failed:`,
 						error.message
 					);
-					this.logErrorToFile(`twitch-batch${bAt}-errors.json`, JSON.stringify(error, null, "\t"));
+					this.logErrorToFile(`twitch-batch${bAt}-errors.json`, JSON.stringify(error, null, "	"));
 				}
 			}
 
@@ -926,11 +1161,144 @@ class StreamMonitor extends EventEmitter {
 				);
 				this.cleanupChannelList(customChannels);
 			} else {
+				// Fallback: try failed channels individually to avoid batch DNS failures
+				const failedChannels = failedBatches.flat();
 				this.logger.warn(
-					`[_pollTwitchChannels] Error polling ${failedBatches.length} batches, trying again.`
+					`[_pollTwitchChannels] Batch failed for ${failedBatches.length} batches (${failedChannels.length} channels). Falling back to per-channel polling.`
 				);
-				this._pollTwitchChannels(failedBatches.flat(1));
+				await this._pollTwitchChannelsIndividual(failedChannels);
 			}
+		}
+	}
+
+	/**
+	 * Poll Twitch channels individually (one-by-one) as fallback when batch fails.
+	 * This avoids DNS failures taking down entire batches.
+	 * @private
+	 */
+	async _pollTwitchChannelsIndividual(channels) {
+		this.logger.info(
+			`[_pollTwitchChannelsIndividual] Polling ${channels.length} channels individually as fallback.`
+		);
+
+		const twitchTimeout = 10000;
+		const individuallyFailed = [];
+
+		for (const channel of channels) {
+			const sanitizedName = this.sanitizePlatformChannelName(channel.name.toLowerCase(), "twitch");
+
+			try {
+				// Get user ID
+				const userResponse = await retryWithBackoff(
+					async () =>
+						await axios.get(`https://api.twitch.tv/helix/users`, {
+							headers: {
+								"Client-ID": this.twitchClientId,
+								Authorization: `Bearer ${this.twitchToken}`
+							},
+							params: { login: [sanitizedName] },
+							timeout: twitchTimeout
+						}),
+					2,
+					1500
+				);
+
+				if (!userResponse.data.data || userResponse.data.data.length === 0) {
+					// Channel not found — track it
+					if (!this.twitchNotFounds[channel.name]) {
+						this.twitchNotFounds[channel.name] = 1;
+						this.logger.warn(`[Individual] Canal da Twitch não encontrado: '${channel.name}'.`);
+					} else {
+						this.twitchNotFounds[channel.name]++;
+						if (this.twitchNotFounds[channel.name] > 50) {
+							await this.pauseChannel(channel.name, "twitch");
+						}
+					}
+					continue;
+				}
+
+				const user = userResponse.data.data[0];
+
+				// Get stream status
+				const streamResponse = await retryWithBackoff(
+					async () =>
+						await axios.get(`https://api.twitch.tv/helix/streams`, {
+							headers: {
+								"Client-ID": this.twitchClientId,
+								Authorization: `Bearer ${this.twitchToken}`
+							},
+							params: { user_id: [user.id] },
+							timeout: twitchTimeout
+						}),
+					2,
+					1500
+				);
+
+				const liveStreams = streamResponse.data.data;
+				const isLiveNow = liveStreams.length > 0;
+				const channelKey = `twitch:${user.login.toLowerCase()}`;
+				const wasLive = this.streamStatuses[channelKey]?.isLive ?? false;
+				const liveStream = liveStreams[0];
+
+				// Update status
+				if (!this.streamStatuses[channelKey]) {
+					this.streamStatuses[channelKey] = {
+						isLive: isLiveNow,
+						lastChecked: new Date().toISOString(),
+						platform: "twitch",
+						channelName: user.login
+					};
+				} else {
+					this.streamStatuses[channelKey].isLive = isLiveNow;
+					this.streamStatuses[channelKey].lastChecked = new Date().toISOString();
+				}
+
+				if (isLiveNow && liveStream) {
+					this.streamStatuses[channelKey].title = liveStream.title;
+					this.streamStatuses[channelKey].thumbnail = liveStream.thumbnail_url
+						.replace("{width}", "640")
+						.replace("{height}", "360");
+					this.streamStatuses[channelKey].viewerCount = liveStream.viewer_count;
+					this.streamStatuses[channelKey].platform = "twitch";
+					this.streamStatuses[channelKey].channelName = user.login;
+					this.streamStatuses[channelKey].startedAt = liveStream.started_at;
+					this.streamStatuses[channelKey].game = liveStream.game_name;
+				}
+
+				// Emit events
+				if (isLiveNow && !wasLive) {
+					await this._emitIfSafe("streamOnline", {
+						platform: "twitch",
+						channelName: user.login,
+						title: liveStream.title,
+						game: liveStream.game_name,
+						thumbnail: liveStream.thumbnail_url
+							.replace("{width}", "640")
+							.replace("{height}", "360"),
+						viewerCount: liveStream.viewer_count,
+						startedAt: liveStream.started_at
+					});
+				} else if (!isLiveNow && wasLive) {
+					await this._emitIfSafe("streamOffline", {
+						platform: "twitch",
+						channelName: user.login
+					});
+				}
+
+				// Update DB
+				await this._updateStatusInDB(channelKey, this.streamStatuses[channelKey]);
+			} catch (error) {
+				individuallyFailed.push(channel);
+				this.logger.error(`[Individual] Failed to poll '${channel.name}':`, error.message);
+			}
+
+			await sleep(500); // Small delay between individual requests
+		}
+
+		if (individuallyFailed.length > 0) {
+			this.logger.warn(
+				`[_pollTwitchChannelsIndividual] ${individuallyFailed.length} channels still failed individually.`
+			);
 		}
 	}
 
@@ -982,14 +1350,33 @@ class StreamMonitor extends EventEmitter {
 
 				if (response.status === 200 && response.data) {
 					const liveData = new Map(response.data.data.map((ch) => [ch.slug.toLowerCase(), ch]));
-					this.logger.info(
-						`[_pollKickChannels] Response: '${JSON.stringify(liveData, null, "\t")}'`
-					);
+					this.logger.info(`[_pollKickChannels] Response: '${JSON.stringify(liveData, null, "	")}'`);
 
 					// Update status for all channels in the batch
 					for (const channel of batch) {
 						const channelKey = `kick:${channel.name.toLowerCase()}`;
 						const channelData = liveData.get(channel.name.toLowerCase());
+
+						if (!channelData) {
+							if (!this.kickNotFounds[channel.name]) {
+								this.kickNotFounds[channel.name] = 1;
+								this.logger.warn(
+									`Canal da Kick não encontrado: '${channel.name}'. Iniciando contagem de erros.`
+								);
+							} else {
+								this.kickNotFounds[channel.name]++;
+								this.logger.warn(
+									`Canal da Kick não encontrado (${this.kickNotFounds[channel.name]} vezes): '${channel.name}'.`
+								);
+								if (this.kickNotFounds[channel.name] > 50) {
+									await this.pauseChannel(channel.name, "kick");
+								}
+							}
+							continue;
+						} else {
+							this.kickNotFounds[channel.name] = 0;
+						}
+
 						const isLiveNow = !!(channelData && channelData.stream && channelData.stream.is_live);
 						const wasLive = this.streamStatuses[channelKey]?.isLive ?? false;
 
@@ -1115,6 +1502,7 @@ class StreamMonitor extends EventEmitter {
 		}
 
 		const chUrls = [`https://www.youtube.com/c/${channel}`, `https://www.youtube.com/@${channel}`];
+		let lastError = null;
 		for (const chUrl of chUrls) {
 			try {
 				//this.logger.debug(`[getYtChannelID] Tentando: ${chUrl}`);
@@ -1138,11 +1526,19 @@ class StreamMonitor extends EventEmitter {
 					return exID;
 				}
 			} catch (error) {
+				lastError = error;
 				this.logger.error(
 					`[getYtChannelID] Erro tentando buscar YouTube channel ID para '${chUrl}':`,
 					error.message
 				);
 			}
+		}
+
+		if (lastError && lastError.response && lastError.response.status === 404) {
+			const err = new Error("YouTube Channel not found (404)");
+			err.status = 404;
+			err.isReal404 = true;
+			throw err;
 		}
 
 		return null;
@@ -1159,11 +1555,24 @@ class StreamMonitor extends EventEmitter {
 
 				// If it's not a channel ID format, try to resolve it
 				if (!channelId.startsWith("UC")) {
-					//this.logger.debug(`[getYtChannelID] ${channelId} não é ID, vou tentar buscar`);
-					channelId = (await this.getYtChannelID(channelId)) ?? channelId;
+					try {
+						const resolved = await this.getYtChannelID(channelId);
+						if (resolved) {
+							channelId = resolved;
+						} else {
+							// Se retornou null sem lançar erro, provavelmente foi um erro temporário (rate limit, etc)
+							// Não fazemos a requisição do feed porque vai dar 404, mas também não incrementamos a falha como 404.
+							continue;
+						}
+					} catch (resolveError) {
+						if (resolveError.isReal404) {
+							// O canal não existe de verdade no YouTube! Repassa o erro para ser tratado no catch externo
+							throw resolveError;
+						}
+						// Outro tipo de erro (ex: bloqueio temporário), apenas continua para o próximo canal sem contar falha
+						continue;
+					}
 				}
-
-				//this.logger.debug(`[_pollYoutubeChannels] Buscando videos para o channelID: ${channelId}`);
 
 				// Get channel info and latest videos using RSS feed
 				const response = await axios.get(
@@ -1207,6 +1616,20 @@ class StreamMonitor extends EventEmitter {
 				// Check if this is a new video
 				const lastVideoId = this.streamStatuses[channelKey]?.lastVideo?.id ?? "";
 				if (videoId !== lastVideoId) {
+					// Failsafe: Only notify if the video was published in the last 24 hours to prevent spam on DB resets/imports
+					const publishedAtStr = latestEntry.published;
+					let isRecent = true;
+					if (publishedAtStr) {
+						const published = new Date(publishedAtStr);
+						const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+						if (published < oneDayAgo) {
+							isRecent = false;
+							this.logger.info(
+								`[Failsafe] Ignoring old YouTube video ${videoId} for ${channel.name} (published at ${publishedAtStr}).`
+							);
+						}
+					}
+
 					// Get more details about the video to determine if it's a livestream
 					const videoResponse = await axios.get(`https://www.youtube.com/watch?v=${videoId}`);
 					const html = videoResponse.data;
@@ -1227,42 +1650,47 @@ class StreamMonitor extends EventEmitter {
 						thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg` // Best quality thumbnail
 					};
 
-					// If it's a livestream, update live status
-					const wasLive = this.streamStatuses[channelKey].isLive;
-					if (isLiveNow) {
-						this.streamStatuses[channelKey].isLive = true;
+					if (isRecent) {
+						// If it's a livestream, update live status
+						const wasLive = this.streamStatuses[channelKey].isLive;
+						if (isLiveNow) {
+							this.streamStatuses[channelKey].isLive = true;
 
-						if (!wasLive) {
-							// Emit streamOnline event
-							await this._emitIfSafe("streamOnline", {
+							if (!wasLive) {
+								// Emit streamOnline event
+								await this._emitIfSafe("streamOnline", {
+									platform: "youtube",
+									channelName: channel.name,
+									title: latestEntry.title,
+									thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
+									url: videoUrl,
+									videoId
+								});
+							}
+						} else {
+							// If it was live before but not now, emit offline event
+							if (wasLive) {
+								this.streamStatuses[channelKey].isLive = false;
+								await this._emitIfSafe("streamOffline", {
+									platform: "youtube",
+									channelName: channel.name
+								});
+							}
+
+							// Emit new video event
+							await this._emitIfSafe("newVideo", {
 								platform: "youtube",
 								channelName: channel.name,
 								title: latestEntry.title,
 								thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
 								url: videoUrl,
-								videoId
+								videoId,
+								publishedAt: latestEntry.published
 							});
 						}
 					} else {
-						// If it was live before but not now, emit offline event
-						if (wasLive) {
-							this.streamStatuses[channelKey].isLive = false;
-							await this._emitIfSafe("streamOffline", {
-								platform: "youtube",
-								channelName: channel.name
-							});
-						}
-
-						// Emit new video event
-						await this._emitIfSafe("newVideo", {
-							platform: "youtube",
-							channelName: channel.name,
-							title: latestEntry.title,
-							thumbnail: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
-							url: videoUrl,
-							videoId,
-							publishedAt: latestEntry.published
-						});
+						// Just update the live status in memory/DB without emitting notifications
+						this.streamStatuses[channelKey].isLive = !!isLiveNow;
 					}
 				} else {
 					// Check if an existing livestream ended
@@ -1293,11 +1721,11 @@ class StreamMonitor extends EventEmitter {
 				await this._updateStatusInDB(channelKey, this.streamStatuses[channelKey]);
 			} catch (error) {
 				// Verifica se é um erro 404 (canal não encontrado)
-				if (error.response && error.response.status === 404) {
+				if (error.status === 404 || (error.response && error.response.status === 404)) {
 					if (!this.youtubeNotFounds[channel.name]) {
 						this.youtubeNotFounds[channel.name] = 1;
 						this.logger.warn(
-							`Canal do YouTube não encontrado: '${channel.name}'. Iniciando monitoramento de not-found para ser removido.`
+							`Canal do YouTube não encontrado: '${channel.name}'. Iniciando contagem de erros.`
 						);
 					} else {
 						this.youtubeNotFounds[channel.name]++;
@@ -1306,49 +1734,7 @@ class StreamMonitor extends EventEmitter {
 							`Canal do YouTube não encontrado (${this.youtubeNotFounds[channel.name]} vezes): '${channel.name}'.`
 						);
 						if (this.youtubeNotFounds[channel.name] > 50) {
-							this.logger.warn(
-								`Canal do YouTube não encontrado: '${channel.name}' muitas vezes. Removendo do monitoramento.`
-							);
-
-							// Remove o canal do monitoramento
-							this.unsubscribe(channel.name, "youtube");
-
-							// Tenta enviar uma mensagem para todos os grupos que monitoram este canal
-							try {
-								// Obtém todos os grupos
-								const groups = await this.database.getGroups();
-
-								// Filtra grupos que monitoram este canal
-								for (const group of groups) {
-									if (Array.isArray(group.youtube)) {
-										const channelConfig = group.youtube.find(
-											(c) => c.channel.toLowerCase() === channel.name.toLowerCase()
-										);
-
-										if (channelConfig) {
-											// Remove o canal da configuração deste grupo
-											group.youtube = group.youtube.filter(
-												(c) => c.channel.toLowerCase() !== channel.name.toLowerCase()
-											);
-
-											// Salva o grupo
-											await this.database.saveGroup(group);
-
-											// Envia uma mensagem de notificação
-											this.emit("channelNotFound", {
-												platform: "youtube",
-												channelName: channel.name,
-												groupId: group.id
-											});
-										}
-									}
-								}
-							} catch (notificationError) {
-								this.logger.error(
-									`Erro ao notificar grupos sobre canal não encontrado: ${channel.name}`,
-									notificationError
-								);
-							}
+							await this.pauseChannel(channel.name, "youtube");
 						}
 					}
 				} else {
@@ -1740,6 +2126,189 @@ class StreamMonitor extends EventEmitter {
 		const sanitized = cleaned.replace(rules.illegalChars, "");
 
 		return sanitized ?? "";
+	}
+
+	/**
+	 * Detecta o status de um canal público (banido, deletado/não encontrado, etc.)
+	 * fazendo uma requisição HTTP simples à página pública da plataforma.
+	 * @param {string} channelName
+	 * @param {string} platform - 'twitch' | 'kick'
+	 * @returns {Promise<'banned'|'deleted'|'unknown'>}
+	 */
+	async detectChannelStatus(channelName, platform) {
+		try {
+			let url;
+			if (platform === "twitch") {
+				url = `https://www.twitch.tv/${channelName}`;
+			} else if (platform === "kick") {
+				url = `https://kick.com/${channelName}`;
+			} else {
+				return "unknown";
+			}
+
+			const response = await axios.get(url, {
+				timeout: 10000,
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+					Accept: "text/html,application/xhtml+xml"
+				},
+				validateStatus: () => true // não lança exceção para 4xx/5xx
+			});
+
+			const body = (response.data || "").toString().toLowerCase();
+
+			if (platform === "twitch") {
+				// Twitch retorna 200 mesmo para banidos/deletados, mas com texto distinto
+				if (
+					body.includes("terms of service") ||
+					body.includes("community guidelines") ||
+					body.includes("temporariamente indispon") ||
+					body.includes("temporarily unavailable")
+				) {
+					return "banned";
+				}
+				if (
+					body.includes("máquina do tempo") ||
+					body.includes("time machine") ||
+					body.includes("content is unavailable") ||
+					body.includes("sorry. unless you") ||
+					response.status === 404
+				) {
+					return "deleted";
+				}
+			} else if (platform === "kick") {
+				if (
+					response.status === 404 ||
+					body.includes("not found") ||
+					body.includes("página não encontrada")
+				) {
+					return "deleted";
+				}
+				if (body.includes("suspended") || body.includes("banned") || body.includes("violat")) {
+					return "banned";
+				}
+			}
+
+			return "unknown";
+		} catch (err) {
+			this.logger.warn(
+				`[detectChannelStatus] Erro ao verificar status de ${platform}/${channelName}: ${err.message}`
+			);
+			return "unknown";
+		}
+	}
+
+	/**
+	 * Pausa um canal por 12 horas devido a erros consecutivos de "não encontrado"
+	 * @param {string} channelName - Nome do canal
+	 * @param {string} platform - Plataforma ('youtube', 'twitch', 'kick')
+	 */
+	async pauseChannel(channelName, platform) {
+		try {
+			this.logger.warn(
+				`Pausando canal ${platform}/${channelName} por 12 horas devido a erros consecutivos de "não encontrado".`
+			);
+
+			// Remove o canal do monitoramento ativo em memória/DB local
+			this.unsubscribe(channelName, platform);
+
+			// Reseta o contador local de erros
+			const p = platform.toLowerCase();
+			const notFoundKey =
+				p === "youtube" ? "youtubeNotFounds" : p === "twitch" ? "twitchNotFounds" : "kickNotFounds";
+			if (this[notFoundKey]) {
+				this[notFoundKey][channelName] = 0;
+			}
+
+			// Define o tempo de pausa (12 horas)
+			const pausedUntil = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString();
+
+			// Obtém todos os grupos
+			const groups = await this.database.getGroups();
+
+			// Filtra grupos que monitoram este canal
+			for (const group of groups) {
+				const platformList = group[p];
+				if (Array.isArray(platformList)) {
+					const channelConfig = platformList.find(
+						(c) => c.channel.toLowerCase() === channelName.toLowerCase()
+					);
+
+					if (channelConfig) {
+						// Define as propriedades de pausa
+						channelConfig.pausedUntil = pausedUntil;
+						channelConfig.pausedReason = "channel_not_found";
+
+						// Salva o grupo
+						await this.database.saveGroup(group);
+
+						// Detecta status do canal (banido vs deletado) — só para Twitch e Kick
+						let channelStatus = "unknown";
+						if (p === "twitch" || p === "kick") {
+							channelStatus = await this.detectChannelStatus(channelName, p);
+							this.logger.info(
+								`[pauseChannel] Status detectado para ${p}/${channelName}: ${channelStatus}`
+							);
+						}
+
+						// Emite evento para notificação
+						this.emit("channelNotFound", {
+							platform: p,
+							channelName,
+							groupId: group.id,
+							groupName: group.name,
+							channelStatus
+						});
+					}
+				}
+			}
+		} catch (error) {
+			this.logger.error(`Erro ao pausar canal ${platform}/${channelName}:`, error);
+		}
+	}
+
+	/**
+	 * Verifica periodicamente se canais pausados já completaram o tempo de suspensão e os reativa
+	 */
+	async checkPausedChannelsReactivation() {
+		try {
+			const groups = await this.database.getGroups();
+			const now = new Date();
+
+			for (const group of groups) {
+				let groupModified = false;
+				const platforms = ["youtube", "twitch", "kick"];
+
+				for (const platform of platforms) {
+					if (group[platform] && Array.isArray(group[platform])) {
+						for (const channelConfig of group[platform]) {
+							if (channelConfig.pausedUntil) {
+								if (new Date(channelConfig.pausedUntil) <= now) {
+									this.logger.info(
+										`Reativando canal ${platform}/${channelConfig.channel} no grupo ${group.id} (pausa expirada)`
+									);
+									delete channelConfig.pausedUntil;
+									delete channelConfig.pausedReason;
+									groupModified = true;
+
+									// Inscreve novamente no StreamMonitor se ele estiver ativo
+									if (this.isMonitoring) {
+										this.subscribe(channelConfig.channel, platform);
+									}
+								}
+							}
+						}
+					}
+				}
+
+				if (groupModified) {
+					await this.database.saveGroup(group);
+				}
+			}
+		} catch (error) {
+			this.logger.error("Erro ao verificar reativação de canais pausados:", error);
+		}
 	}
 }
 

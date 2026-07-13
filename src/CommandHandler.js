@@ -45,6 +45,27 @@ class CommandHandler {
 			error: "❌"
 		};
 
+		// Prevenção de Spam (Debounce e Ban)
+		this.spamLogger = new Logger("spam-prevention");
+		this.cmdDebounceTime = parseInt(process.env.CMD_DEBOUNCE) || 3000;
+		this.debounceBanLimit = parseInt(process.env.DEBOUNCE_BAN) || 10;
+		this.debounceDecayTime = (parseInt(process.env.DEBOUNCE_DECAY) || 60) * 1000;
+		this.userDebounceMap = new Map();
+
+		// Timer para decaimento periódico das tentativas de bypass
+		this.decayInterval = setInterval(() => {
+			const now = Date.now();
+			for (const [userId, record] of this.userDebounceMap.entries()) {
+				if (record.bypassCount > 0) {
+					record.bypassCount--;
+				}
+				// Limpa registros inativos para economizar memória
+				if (record.bypassCount === 0 && (!record.bannedUntil || now >= record.bannedUntil)) {
+					this.userDebounceMap.delete(userId);
+				}
+			}
+		}, this.debounceDecayTime);
+
 		// Inicializa cache de comandos
 		this.loadAllCommands();
 	}
@@ -441,6 +462,87 @@ class CommandHandler {
 	 */
 	async handleCommand(bot, message, commandText, group) {
 		try {
+			const userId = message.author || message.authorAlt || message.from;
+			if (userId) {
+				// Ignorar prevenção de spam para super admins/dono do bot
+				const isSuperAdmin =
+					this.superAdmin.isSuperAdmin(userId) ||
+					(this.adminUtils &&
+						typeof this.adminUtils.isComuAdmin === "function" &&
+						this.adminUtils.isComuAdmin(userId, bot));
+
+				if (!isSuperAdmin) {
+					const now = Date.now();
+					let record = this.userDebounceMap.get(userId);
+
+					if (!record) {
+						record = {
+							lastCommandTime: 0,
+							bypassCount: 0,
+							bannedUntil: 0
+						};
+						this.userDebounceMap.set(userId, record);
+					}
+
+					// Verifica se o usuário está atualmente banido
+					if (record.bannedUntil && now < record.bannedUntil) {
+						this.spamLogger.warn(
+							`[SpamPrevention] Usuário ${userId} tentou executar '${commandText.trim()}' mas está banido por spam até ${new Date(record.bannedUntil).toISOString()}`
+						);
+						return null;
+					}
+
+					// Verifica se passou do tempo mínimo do debounce
+					const elapsed = now - record.lastCommandTime;
+					if (elapsed < this.cmdDebounceTime) {
+						record.bypassCount++;
+						record.lastCommandTime = now; // Reinicia o cronômetro do debounce
+
+						this.spamLogger.warn(
+							`[SpamPrevention] Usuário ${userId} violou o debounce com '${commandText.trim()}' (${elapsed}ms < ${this.cmdDebounceTime}ms). Tentativas de bypass: ${record.bypassCount}/${this.debounceBanLimit}`
+						);
+
+						if (record.bypassCount >= this.debounceBanLimit) {
+							record.bannedUntil = now + 3600000; // Banido por 1 hora
+							this.spamLogger.error(
+								`[SpamPrevention] Usuário ${userId} foi banido de usar comandos por 1 hora (excedeu o limite de bypass: ${record.bypassCount}/${this.debounceBanLimit})`
+							);
+
+							// Reage com o emoji 📵
+							try {
+								if (message.origin && typeof message.origin.react === "function") {
+									await message.origin.react("📵").catch((err) => {
+										this.logger.error("Erro ao reagir com emoji 📵:", err.message ?? "xxx");
+									});
+								}
+							} catch (reactError) {
+								this.logger.error(
+									"Erro ao aplicar reação de banimento:",
+									reactError.message ?? "xxx"
+								);
+							}
+
+							// Notifica no chat apropriado
+							const replyToChat = message.group ?? message.author;
+							const returnMessage = new ReturnMessage({
+								chatId: replyToChat,
+								content: `⚠️ *Prevenção de Spam:* Você foi banido de usar comandos por 1 hora por exceder o limite de spam.`
+							});
+							await bot.sendReturnMessages(returnMessage, group).catch((err) => {
+								this.logger.error(
+									"Erro ao enviar mensagem de banimento por spam:",
+									err.message ?? "xxx"
+								);
+							});
+						}
+						return null; // Interrompe a execução
+					}
+
+					// Se passou no debounce, atualiza o timestamp do último comando executado com sucesso/tentativa
+					record.lastCommandTime = now;
+				}
+			}
+
 			// Obtém a primeira palavra como nome do comando
 			const [command, ...args] = commandText.trim().split(/\s+/);
 
@@ -540,9 +642,9 @@ class CommandHandler {
 				if (command === "g-manage") {
 					if (args.length > 0) {
 						// Tem argumento, está tentando definir um grupo no PV
-						const groupName = args[0].toLowerCase();
+						const groupName = args[0].trim().toLowerCase();
 						const groups = await this.database.getGroups();
-						const targetGroup = groups.find((g) => g.name.toLowerCase() === groupName);
+						const targetGroup = groups.find((g) => g.name.trim().toLowerCase() === groupName);
 
 						if (targetGroup) {
 							const isUserAdminInTarget = await this.adminUtils.isAdmin(
@@ -597,8 +699,49 @@ class CommandHandler {
 						if (!silent) await bot.sendReturnMessages(returnMessage, group);
 						return returnMessage;
 					}
+				} else if (command === "g-painel" && args.length > 0) {
+					// Permite !g-painel nomegrupo diretamente no PV
+					const groupName = args[0].trim().toLowerCase();
+					const groups = await this.database.getGroups();
+					const targetGroup = groups.find((g) => g.name.trim().toLowerCase() === groupName);
+
+					if (targetGroup) {
+						const isUserAdminInTarget = await this.adminUtils.isAdmin(
+							message.author,
+							targetGroup,
+							false,
+							bot
+						);
+						if (isUserAdminInTarget) {
+							this.privateManagement[message.author] = targetGroup.id;
+							this.logger.info(
+								`Usuário ${message.author} agora está gerenciando o grupo (via g-painel): ${targetGroup.name} (${targetGroup.id})`
+							);
+							group = targetGroup;
+							replyToChat = message.author;
+							isManagingFromPrivate = true;
+						} else {
+							const returnMessage = new ReturnMessage({
+								chatId: message.author,
+								content: `Você *NÃO É* administrador do grupo '${targetGroup.name}'.`,
+								reaction: "🙅‍♂️"
+							});
+							if (!silent) await bot.sendReturnMessages(returnMessage, group);
+							return returnMessage;
+						}
+					} else {
+						this.logger.warn(`Grupo não encontrado: ${groupName}`);
+
+						const returnMessage = new ReturnMessage({
+							chatId: message.author,
+							content: `Grupo não encontrado: ${groupName}`,
+							reaction: this.defaultReactions.after
+						});
+						if (!silent) await bot.sendReturnMessages(returnMessage, group);
+						return returnMessage;
+					}
 				} else {
-					// Não é g-manage, então verifica se o cara já está gerenciando um pelo PV
+					// Não é g-manage ou g-painel com argumentos, então verifica se o cara já está gerenciando um pelo PV
 
 					if (this.privateManagement[message.author]) {
 						const managedGroupId = this.privateManagement[message.author];
@@ -881,7 +1024,15 @@ class CommandHandler {
 	 * @param {Group} group - O objeto do grupo (se em grupo)
 	 * @param {boolean} silent - Se true, não envia mensagens nem reage
 	 */
-	async executeFixedCommand(bot, message, command, args, group, silent = false) {
+	async executeFixedCommand(
+		bot,
+		message,
+		command,
+		args,
+		group,
+		silent = false,
+		silentReaction = false
+	) {
 		try {
 			// this.logger.info(
 			// 	`[${bot.id}][${message.author ?? message.authorAlt}@${group?.name ?? "PV"}] Executando comando fixo '${command.name}'`,
@@ -906,7 +1057,7 @@ class CommandHandler {
 			if (group && group.mutedCommands && Array.isArray(group.mutedCommands)) {
 				if (command && group.mutedCommands.includes(command.name)) {
 					this.logger.debug(`Ignorando comando '${command.name}' pois está silenciado no grupo.`);
-					message.origin.react("⛔️");
+					if (!silent && !silentReaction) message.origin.react("⛔️");
 					return null;
 				}
 			}
@@ -927,7 +1078,7 @@ class CommandHandler {
 				const chat = await message.origin.getChat();
 				const isUserAdmin = await this.adminUtils.isAdmin(message.author, group, chat, bot);
 				if (!isUserAdmin) {
-					message.origin.react("📵");
+					if (!silent && !silentReaction) message.origin.react("📵");
 					this.logger.debug(`Comando ${command.name} requer administrador, mas o usuário não é`, {
 						author: message.author,
 						group,
@@ -944,8 +1095,14 @@ class CommandHandler {
 				// Verifica a mensagem citada para mídia se a mensagem direta não tiver
 				let hasQuotedMedia = false;
 				if (!hasDirectMedia) {
-					const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
-					hasQuotedMedia = quotedMsg && quotedMsg.hasMedia;
+					// Se há referência a uma mensagem citada (mesmo que o cache tenha expirado),
+					// passa o comando adiante para que ele possa retornar a mensagem de erro adequada
+					if (message.hasQuotedMsg) {
+						hasQuotedMedia = true; // deixa o comando tratar o caso de cache expirado
+					} else {
+						const quotedMsg = await message.origin.getQuotedMessage().catch(() => null);
+						hasQuotedMedia = quotedMsg && quotedMsg.hasMedia;
+					}
 				}
 
 				if (!hasDirectMedia && !hasQuotedMedia) {
@@ -969,7 +1126,7 @@ class CommandHandler {
 				this.logger.debug(`Comando ${command.name} não está disponível neste horário/dia`);
 
 				// Reage com emoji de relógio
-				if (!silent) {
+				if (!silent && !silentReaction) {
 					try {
 						message.origin.react("🕒");
 					} catch (reactError) {
@@ -1001,7 +1158,7 @@ class CommandHandler {
 			}
 
 			// Reage com emoji "antes" (específico do comando ou padrão)
-			if (!silent && command.reactions?.before) {
+			if (!silent && !silentReaction && command.reactions?.before) {
 				try {
 					message.origin.react(command.reactions?.before);
 				} catch (reactError) {
@@ -1013,7 +1170,7 @@ class CommandHandler {
 			if (typeof command.method === "function") {
 				this.updateCooldown(command, groupId, bot.id);
 				//this.logger.debug(`Comando ${command.name} tem method, executando`);
-				const result = await command.method(bot, message, args, group);
+				let result = await command.method(bot, message, args, group);
 
 				// Log usage
 				this.cmdUsage.logCommand({
@@ -1032,6 +1189,13 @@ class CommandHandler {
 
 				// Verifica se o resultado é um ReturnMessage ou array de ReturnMessages
 				if (result) {
+					if (typeof result === "string") {
+						result = new ReturnMessage({
+							chatId: groupId,
+							content: result,
+							options: { quotedMessageId: message.origin.id._serialized }
+						});
+					}
 					if (
 						result instanceof ReturnMessage ||
 						(Array.isArray(result) && result.length > 0 && result[0] instanceof ReturnMessage)
@@ -1039,9 +1203,20 @@ class CommandHandler {
 						// Adiciona reação "depois" nas mensagens se não estiver definida
 
 						const messages = Array.isArray(result) ? result : [result];
+						const requesterId = message.authorAlt || message.author;
+
 						messages.forEach((msg) => {
 							if (!msg.reactions && command.reactions?.after) {
 								msg.reaction = command.reactions?.after;
+							}
+
+							// Auto-mention do usuário que pediu o comando (apenas em grupos)
+							if (requesterId && msg instanceof ReturnMessage && message.group) {
+								if (!msg.options) msg.options = {};
+								if (!msg.options.mentions) msg.options.mentions = [];
+								if (!msg.options.mentions.includes(requesterId)) {
+									msg.options.mentions.push(requesterId);
+								}
 							}
 						});
 
@@ -1053,7 +1228,7 @@ class CommandHandler {
 				//this.logger.debug(`Comando ${command.name} executado com sucesso, enviando after reaction`);
 
 				// Reage com emoji "depois" (específico do comando ou padrão)
-				if (!silent && command.reactions?.after && result !== false) {
+				if (!silent && !silentReaction && command.reactions?.after && result !== false) {
 					this.delayedReaction(message.origin, command.reactions.after, 1000);
 				}
 
@@ -1063,7 +1238,7 @@ class CommandHandler {
 
 				// Reage com emoji "depois" mesmo para erro
 				const afterEmoji = command.reactions?.after ?? this.defaultReactions.after;
-				if (!silent) {
+				if (!silent && !silentReaction) {
 					try {
 						message.origin.react(afterEmoji);
 					} catch (reactError) {
@@ -1081,7 +1256,7 @@ class CommandHandler {
 			const returnMessage = new ReturnMessage({
 				chatId,
 				content: `Erro ao executar comando: ${command.name}`,
-				reaction: errorEmoji
+				reaction: !silent && !silentReaction ? errorEmoji : undefined
 			});
 			if (!silent) await bot.sendReturnMessages(returnMessage, group);
 			return returnMessage;
@@ -1155,7 +1330,15 @@ class CommandHandler {
 	 * @param {Group} group - O objeto do grupo
 	 * @param {boolean} silent - Se true, não envia mensagens nem reage
 	 */
-	async executeCustomCommand(bot, message, command, args, group, silent = false) {
+	async executeCustomCommand(
+		bot,
+		message,
+		command,
+		args,
+		group,
+		silent = false,
+		silentReaction = false
+	) {
 		try {
 			//this.logger.info(`Executando comando personalizado: ${command.startsWith}`);
 
@@ -1173,7 +1356,7 @@ class CommandHandler {
 				if (!isUserAdmin) {
 					this.logger.debug(`Comando ${command.name} requer administrador, mas o usuário não é`);
 
-					if (!silent) {
+					if (!silent && !silentReaction) {
 						try {
 							message.origin.react("⛔️");
 						} catch (reactError) {
@@ -1197,7 +1380,7 @@ class CommandHandler {
 				this.logger.debug(`Comando ${command.startsWith} não está disponível neste horário/dia`);
 
 				// Reage com emoji de relógio
-				if (!silent) {
+				if (!silent && !silentReaction) {
 					try {
 						message.origin.react("🕒");
 					} catch (reactError) {
@@ -1217,8 +1400,9 @@ class CommandHandler {
 				return returnMessage;
 			}
 
-			// Verifica cooldown
-			const cooldownInfo = await this.checkCooldown(command.startsWith, message.group, bot.id);
+			// Verifica cooldown (passa objeto inteiro para que o cooldown personalizado do comando seja respeitado)
+			const cooldownCheckCmd = { name: command.startsWith, cooldown: command.cooldown ?? 0 };
+			const cooldownInfo = await this.checkCooldown(cooldownCheckCmd, message.group, bot.id);
 
 			if (cooldownInfo.inCooldown) {
 				this.logger.debug(
@@ -1236,7 +1420,7 @@ class CommandHandler {
 			}
 
 			// Reage com emoji antes (do comando ou padrão)
-			if (!silent && command.reactions?.before) {
+			if (!silent && !silentReaction && command.reactions?.before) {
 				try {
 					await message.origin.react(command.reactions?.before);
 				} catch (reactError) {
@@ -1264,7 +1448,7 @@ class CommandHandler {
 			});
 
 			// Reage à mensagem se especificado (esta é a reação específica do comando)
-			if (!silent && command.react) {
+			if (!silent && !silentReaction && command.react) {
 				try {
 					this.logger.debug(`Reagindo à mensagem com: ${command.react}`);
 					await message.origin.react(command.react);
@@ -1298,12 +1482,20 @@ class CommandHandler {
 							processedMessage.chatId = message.author; // ou authorAlt?
 						}
 						// Adiciona menções do comando
+						if (!processedMessage.options) processedMessage.options = {};
+						const mentionsSet = new Set(processedMessage.options.mentions || []);
+
 						if (command.mentions && command.mentions.length > 0) {
-							if (!processedMessage.options) processedMessage.options = {};
-							const existing = new Set(processedMessage.options.mentions || []);
-							command.mentions.forEach((m) => existing.add(m));
-							processedMessage.options.mentions = Array.from(existing);
+							command.mentions.forEach((m) => mentionsSet.add(m));
 						}
+
+						// Auto-mention do usuário que pediu o comando (apenas em grupos e se não for resposta privada)
+						if (message.group && !command.replyInPvivate) {
+							const requesterId = message.authorAlt || message.author;
+							if (requesterId) mentionsSet.add(requesterId);
+						}
+
+						processedMessage.options.mentions = Array.from(mentionsSet);
 						returnMessages.push(processedMessage);
 					}
 				}
@@ -1333,12 +1525,20 @@ class CommandHandler {
 						returnMessage.chatId = message.author; // ou authorAlt?
 					}
 					// Adiciona menções do comando
+					if (!returnMessage.options) returnMessage.options = {};
+					const mentionsSet = new Set(returnMessage.options.mentions || []);
+
 					if (command.mentions && command.mentions.length > 0) {
-						if (!returnMessage.options) returnMessage.options = {};
-						const existing = new Set(returnMessage.options.mentions || []);
-						command.mentions.forEach((m) => existing.add(m));
-						returnMessage.options.mentions = Array.from(existing);
+						command.mentions.forEach((m) => mentionsSet.add(m));
 					}
+
+					// Auto-mention do usuário que pediu o comando (apenas em grupos e se não for resposta privada)
+					if (message.group && !command.replyInPvivate) {
+						const requesterId = message.authorAlt || message.author;
+						if (requesterId) mentionsSet.add(requesterId);
+					}
+
+					returnMessage.options.mentions = Array.from(mentionsSet);
 					if (!silent) await bot.sendReturnMessages(returnMessage, group);
 				}
 				finalResult = returnMessage;
@@ -1346,7 +1546,7 @@ class CommandHandler {
 
 			// Reage com emoji depois (do comando ou padrão)
 			const afterEmoji = command.reactions?.after ?? null;
-			if (!silent) {
+			if (!silent && !silentReaction) {
 				try {
 					if (afterEmoji && command.react !== false) {
 						message.origin.react(afterEmoji);
@@ -1367,7 +1567,7 @@ class CommandHandler {
 			const returnMessage = new ReturnMessage({
 				chatId: message.group,
 				content: `Erro ao executar comando personalizado: ${command.startsWith}`,
-				reaction: command.react !== false ? errorEmoji : null
+				reaction: !silent && !silentReaction && command.react !== false ? errorEmoji : null
 			});
 			if (!silent) await bot.sendReturnMessages(returnMessage, group);
 			return returnMessage;
@@ -1381,9 +1581,9 @@ class CommandHandler {
 		const matchResult = this.findCustomCommand(command, this.customCommands[group.id]);
 
 		if (matchResult) {
-			const { customCommand } = matchResult;
+			const { customCommand, newArgs } = matchResult;
 			this.logger.debug(`[processCustomIgnoresPrefix] `, customCommand);
-			this.executeCustomCommand(bot, message, customCommand, [], group);
+			this.executeCustomCommand(bot, message, customCommand, newArgs, group);
 		}
 	}
 
@@ -1693,12 +1893,14 @@ class CommandHandler {
 
 						// 2 tipos de interação: Um usa o !interagir e outro pega comando custom do grupo
 						// Se não tiver custom, sempre usar LLM
-						const interagirLLM = Math.random() > 0.7 || autoCommands.length == 0;
+						const proporcaoVal =
+							group.interact.proporcao !== undefined ? group.interact.proporcao : 50;
+						const interagirLLM = autoCommands.length == 0 || Math.random() * 100 < proporcaoVal;
 						if (interagirLLM) {
 							const interactCommand = this.fixedCommands.getCommand("interagir");
 							this.logger.info(`[interagir] Acionando LLM-Interagir`);
 
-							this.executeFixedCommand(bot, message, interactCommand, [false], group);
+							this.executeFixedCommand(bot, message, interactCommand, [false], group, false, true);
 							return;
 						} else {
 							const randomCommand = autoCommands[Math.floor(Math.random() * autoCommands.length)];
@@ -1707,7 +1909,7 @@ class CommandHandler {
 							);
 
 							// Executa o comando
-							this.executeCustomCommand(bot, message, randomCommand, [], group);
+							this.executeCustomCommand(bot, message, randomCommand, [], group, false, true);
 							return;
 						}
 					}
@@ -1724,12 +1926,14 @@ class CommandHandler {
 				) {
 					this.logger.debug(`Encontrado comando auto-acionado: ${command.startsWith}`);
 					// Executa o comando, mas não espera para evitar bloqueio
-					this.executeCustomCommand(bot, message, command, [], group).catch((error) => {
-						this.logger.error(
-							`Erro no comando auto-acionado ${command.startsWith}:`,
-							error.message ?? "xxx"
-						);
-					});
+					this.executeCustomCommand(bot, message, command, [], group, false, true).catch(
+						(error) => {
+							this.logger.error(
+								`Erro no comando auto-acionado ${command.startsWith}:`,
+								error.message ?? "xxx"
+							);
+						}
+					);
 					break; // Executa apenas o primeiro comando correspondente
 				}
 			}
