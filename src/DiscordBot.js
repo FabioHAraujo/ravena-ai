@@ -694,7 +694,7 @@ https://www.google.com/maps/search/?api=1&query=${content.latitude},${content.lo
 
 			// --- Tratamento de Opções ---
 			// Suppress all pings — Discord mentions are noisy; we show names inline instead.
-			discordPayload.allowed_mentions = { parse: [] };
+			discordPayload.allowedMentions = { parse: [] };
 
 			if (
 				options.mentions &&
